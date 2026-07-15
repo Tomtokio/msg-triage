@@ -2,7 +2,7 @@
 
 ## Convenzioni
 - Codice e nomi variabili in INGLESE. Stringhe rivolte all'utente in ITALIANO.
-- Python 3.11+. Type hints dove sensato. requests per HTTP.
+- Python 3.12+. Type hints dove sensato. requests per HTTP.
 - Segreti SOLO da variabili d'ambiente. Mai hardcoded, mai committati.
 - Un modulo per responsabilità: source_adapter (interfaccia) / callbell_adapter /
   triage_engine / memory / renderers / tts / telegram_bot / storage.
