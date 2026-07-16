@@ -1,0 +1,28 @@
+[project]
+name = "msg-triage"
+version = "0.0.1"
+description = "VetTriage v0 — bot Telegram di triage per conversazioni Callbell/WhatsApp"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40",
+    "python-telegram-bot>=21.0",   # v21+ è async → impatta T8, qui solo dichiarata
+    "requests>=2.31",
+    "supabase>=2.0",
+    "python-dotenv>=1.0",          # carica .env in locale
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+msg-triage = "msg_triage.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["msg_triage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
