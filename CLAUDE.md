@@ -40,7 +40,10 @@ Non saltare queste pause. Mai.
 - Test: `.venv/bin/python -m pytest`
 - Deploy target: VPS `vps-agenti` (systemd). Il deploy lo fa Tommaso.
 
-## Da verificare sul dato reale (non assumere)
-1. Schema paginazione Callbell (ipotizzato `data["pagination"]["nextPage"]`) — confermare con curl.
-2. Marcatura messaggio in entrata vs uscita (confronto `from` col telefono del contatto).
+## Fatti Callbell verificati sul dato reale (2026-07-16)
+1. Paginazione: envelope `meta: {page, pages}` — iterare finché `page < pages` (NON `data["pagination"]["nextPage"]`).
+2. Marcatura in/out: campo messaggio `status` — `received`=cliente, `sent`=operatore, `note`=nota (NON confronto `from`/telefono).
+3. Telefono del contatto = `phoneNumber`; `assignedUser` (email o null) = segnale PRESIDIO nel formato neutro.
+4. Note di sistema (`status` note, senza `uuid`, `from == to`) distinte dalle note scritte dalle colleghe.
+5. `/contacts` ~332 pagine, ordinato per attività: la finestra temporale è il filtro primario, non paginare tutto.
 Vedi `docs/dev_notes.md` per il dettaglio.
