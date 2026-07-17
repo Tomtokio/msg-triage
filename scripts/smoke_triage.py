@@ -19,6 +19,7 @@ from pathlib import Path
 
 from msg_triage.config import ConfigError, load_config
 from msg_triage.logging_setup import setup_logging
+from msg_triage.renderers import render_all
 from msg_triage.source_adapter import Conversation, Message, Role
 from msg_triage.triage_engine import TriageResult, build_triage_engine
 
@@ -89,6 +90,19 @@ def _print_result(result: TriageResult) -> None:
             print(f"  promessa: {p.testo!r} (scadenza stimata: {p.scadenza_stimata})")
 
 
+def _print_rendered(result: TriageResult) -> None:
+    """Show the three T5 formats. The vocale char count is printed on purpose: it
+    is the thing to watch — if stato_sintetico is long, the voice reads long too."""
+    rendered = render_all(result)
+    for title, text in (
+        ("SCHEMA", rendered.schema_text),
+        ("TABELLA", rendered.table_text),
+        ("VOCALE", rendered.vocal_text),
+    ):
+        print(f"\n========== {title} ==========\n{text}")
+    print(f"\n[vocale: {len(rendered.vocal_text)} caratteri]")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -122,6 +136,7 @@ def main() -> int:
     engine = build_triage_engine(config)
     result = engine.triage(conversations)
     _print_result(result)
+    _print_rendered(result)
     return 0
 
 
