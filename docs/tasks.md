@@ -15,13 +15,13 @@ Scaffolding Python sull'Hetzner, configurazione e segreti.
 
 ## T2 — Source adapter + client Callbell
 Recupero conversazioni recenti, dietro un'interfaccia astratta (source adapter).
-- Definire l'interfaccia neutra: una conversazione = {contact_id stabile, nome, canale,
-  lista messaggi con {role: CLIENTE/OPERATORE/NOTA_INTERNA, testo, timestamp}, tags}
+- Definire l'interfaccia neutra: una conversazione = {contact_id stabile, nome, canale, assigned_user,
+  lista messaggi con {role: CLIENTE/OPERATORE/NOTA_INTERNA/NOTA_SISTEMA, testo, timestamp}, tags}
 - Implementare l'adattatore Callbell su questa interfaccia:
   GET /contacts (paginato) + GET /contacts/:uuid/messages
 - Filtro per finestra temporale (default 6h, parametrico)
-- Ruoli: CLIENTE / OPERATORE / NOTA_INTERNA_COLLEGA
-- VERIFICARE su risposta reale: schema paginazione e marcatura messaggi in entrata
+- Ruoli: CLIENTE / OPERATORE / NOTA_INTERNA / NOTA_SISTEMA
+- Schema paginazione e marcatura messaggi: VERIFICATO su dato reale (2026-07-16 — vedi dev_notes.md)
 **Completamento:** funzione che ritorna conversazioni nel formato NEUTRO (non Callbell-specifico).
 **Dipendenze:** T1.
 **Nota:** il triage a valle non deve mai vedere strutture dati Callbell-specifiche.

@@ -10,8 +10,8 @@
 ## Principio architetturale n.1: disaccoppiamento dalla fonte
 Il triage NON conosce Callbell. Esiste un'interfaccia "source adapter" che restituisce
 conversazioni in un formato NEUTRO:
-  Conversation = { contact_id (stabile), name, channel, tags[], messages[] }
-  Message = { role: CLIENTE|OPERATORE|NOTA_INTERNA, text, timestamp }
+  Conversation = { contact_id (stabile), name, channel, tags[], assigned_user, messages[] }
+  Message = { role: CLIENTE|OPERATORE|NOTA_INTERNA|NOTA_SISTEMA, text, timestamp }
 callbell_adapter è UNA implementazione. Domani un whatsapp_adapter o altro BSP si aggiunge
 senza toccare triage_engine, memory, renderers. Questo è ciò che rende il triage un asset
 portabile anche quando l'utente lascerà Callbell.
@@ -54,18 +54,32 @@ loro lavoro, cambierebbe il clima. Inserire questo vincolo nero su bianco nel sy
 - promessa_scadenza_stimata: quando era attesa una risposta (solo se una promessa esplicita è
   stata rilevata). Da questi due nasce il segnale "promessa scaduta". Sono campi distinti.
 
-## Vincoli Callbell (da documentazione, DA CONFERMARE su dato reale)
+## Vincoli Callbell (VERIFICATO su dato reale, 2026-07-16)
 - Base URL https://api.callbell.eu/v1 — header "Authorization: Bearer <key>".
 - API solo su piano "Chat Management Plus" (l'utente RESTA su questo piano; downgrade
   incompatibile col progetto perché toglie l'accesso API).
-- GET /contacts/:uuid/messages → messaggi in ordine createdAt DESCENDENTE, paginati.
-- Note interne: status == "note".
+- Envelope + paginazione: GET /contacts → {contacts[], meta: {page, pages}}; GET
+  /contacts/:uuid/messages → {messages[], meta: {page, pages}}. Iterare finché page < pages
+  (NON esiste data["pagination"]["nextPage"]).
+- Messaggi in ordine createdAt DESCENDENTE. Campo del testo = "text".
+- Marcatura IN/OUT: campo messaggio "status" — "received" = CLIENTE, "sent" = OPERATORE,
+  "note" = nota. (NON serve confrontare "from" col telefono del contatto.)
+- Note: due tipi di status "note" da DISTINGUERE —
+  - nota UMANA di una collega: ha "uuid" e "from" != "to" → ruolo NOTA_INTERNA.
+  - nota di SISTEMA (es. "Conversation was assigned to X"): NIENTE "uuid" e "from" == "to" → ruolo NOTA_SISTEMA.
+- Contatto "assignedUser": email dell'operatore assegnato (oppure null) → segnale per il PRESIDIO,
+  entra nel formato neutro come assigned_user.
+- Telefono del contatto: campo "phoneNumber" (non "phone"); non serve per l'in/out.
+- Volume e ordine: /contacts ha ~332 pagine di storico ed è ordinato per ATTIVITÀ RECENTE (il
+  messaggio più recente decresce scendendo nella lista). NON c'è sort server-side ("?sort"
+  ignorato) e l'unico timestamp sul contatto è "createdAt" (creazione, NON ultima attività).
+  => la FINESTRA TEMPORALE è il filtro primario: paginare /contacts e, per ogni contatto,
+  guardare il messaggio più recente; fermarsi dopo N contatti consecutivi fuori finestra.
+  MAI paginare tutte le 332 pagine.
 - Rate limit: gestire 429 con Retry-After + backoff, pausa ~0.3s tra richieste.
-- DA VERIFICARE AL PRIMO LANCIO:
-  1. Schema esatto paginazione (ipotizzato data["pagination"]["nextPage"]). Fare una curl reale
-     a /contacts?page=1 e adattare.
-  2. Marcatura messaggio IN ENTRATA vs USCITA. Approccio attuale: confronto campo "from" col
-     telefono del contatto. Validare sul dato vero PRIMA di fidarsi.
+- Campi confermati — Contatto: uuid, name, phoneNumber, createdAt, closedAt, tags[],
+  assignedUser, source, channel{uuid,title,type}, note. Messaggio: text, status, uuid, from,
+  to, createdAt, channel.
 
 ## Anti-pattern (NON fare)
 - NON usare webhook in v0. Pull a comando.
