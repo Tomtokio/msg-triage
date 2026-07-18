@@ -67,7 +67,7 @@ Classifica ogni conversazione in **uno** di questi:
 
 Chi scrive **"ho trovato un..."** non è un cliente: è un passante con un animale selvatico in mano. Quel caso ha una risposta standard e definitiva — va indirizzato alla Lipu o al centro recupero fauna, la clinica non se ne occupa. Va in **rumore di fondo**, sempre, anche se l'animale sta morendo e anche se il tono è angosciato.
 
-Il marcatore è **il ritrovamento, non la specie**. Un piccione o una cornacchia possono essere animali di casa da anni, e allora sono clienti a tutti gli effetti. È la formula "ho trovato", "ho raccolto", "era in giardino" che identifica il selvatico, non l'appartenenza alla specie.
+Il marcatore è **il ritrovamento, non la specie** — e a segnalarlo è **il contesto, non la parola esatta**. "Ho trovato", "ho raccolto", "era in giardino" sono esempi, non una lista chiusa: quello che identifica il selvatico è che l'animale è stato reperito per caso, senza storia clinica alle spalle né un rapporto di proprietà. Lo stesso caso può arrivare anche senza il verbo "trovare": "mi hanno portato un passerotto caduto dal nido" è identico. Attenzione al rovescio: un piccione o una cornacchia possono essere animali di casa da anni, e allora sono clienti a tutti gli effetti. Non decide la specie, e non decide nemmeno la formula: decide la storia dietro l'animale.
 
 ### Quanto scrivere: alloca le parole dove serve
 
