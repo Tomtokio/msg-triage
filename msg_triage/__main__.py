@@ -1,8 +1,8 @@
-"""Entry point: load config, log readiness, exit.
+"""Entry point: load config, then run the Telegram bot (long polling).
 
 Runnable as ``python -m msg_triage`` or via the ``msg-triage`` console script.
-In T1 this only verifies that secrets are present and logs "ready"; in T8 it
-becomes the Telegram bot launcher.
+Boots by loading ``.env`` (if present) and validating secrets, then hands off to
+``telegram_bot.run_bot`` which blocks on long polling until interrupted.
 """
 
 from __future__ import annotations
@@ -37,16 +37,21 @@ def _load_dotenv_if_present() -> None:
 
 
 def main() -> int:
-    """Boot the app far enough to confirm the environment is usable."""
+    """Boot the app: load config, then run the Telegram bot (blocking)."""
     _load_dotenv_if_present()
     setup_logging()
     try:
-        load_config()
+        config = load_config()
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         return 1
 
-    logger.info("VetTriage ready — secrets loaded: %s", ", ".join(present_keys()))
+    logger.info("VetTriage — secrets loaded: %s", ", ".join(present_keys()))
+    # Imported lazily so the entry point stays import-light (telegram is pulled in
+    # only when we actually launch the bot).
+    from msg_triage.telegram_bot import run_bot
+
+    run_bot(config)
     return 0
 
 
