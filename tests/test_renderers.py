@@ -219,6 +219,38 @@ def test_table_row_has_symbols_bold_name_and_no_enum_triplet():
     assert len([l for l in table.splitlines() if " — " in l]) == 3
 
 
+def test_table_strips_leading_client_name_from_prose():
+    r = _result(
+        _entry(
+            gruppo=Gruppo.IN_CORSO,
+            nome="Sig.ra Rossi",
+            stato_sintetico="Sig.ra Rossi chiede quando è pronta la ricetta.",
+        )
+    )
+    row = next(l for l in render_table(r).splitlines() if "<b>Sig.ra Rossi</b>" in l)
+    assert row.count("Sig.ra Rossi") == 1  # only in the bold prefix, not doubled in prose
+    assert "<b>Sig.ra Rossi</b> — Chiede quando" in row
+    # Schema is untouched: the name stays wherever the model wove it into the prose.
+    assert "Sig.ra Rossi chiede" in render_schema(r)
+
+
+def test_table_keeps_prose_when_name_is_not_leading():
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", stato_sintetico="La signora Bianchi aspetta conferma.")
+    )
+    row = next(l for l in render_table(r).splitlines() if "<b>Bianchi</b>" in l)
+    assert "La signora Bianchi aspetta" in row  # not stripped: the name is mid-sentence
+
+
+def test_table_strips_stray_marker_left_by_truncation():
+    # A multi-word species marker cut mid-pair by the 80-char truncation.
+    stato = ("parola " * 9) + "**parrocchetto australiano** che sta male"
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Z", stato_sintetico=stato))
+    row = next(l for l in render_table(r).splitlines() if "<b>Z</b>" in l)
+    assert "**" not in row  # the stray opening marker is removed
+    assert row.endswith("…")  # the row was truncated
+
+
 # --- HTML markup: escaping, italic species, status symbols ---------------------
 
 

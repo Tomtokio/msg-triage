@@ -272,12 +272,29 @@ def _table_section(header: str, entries: list[ConversationTriage]) -> str:
     return "\n".join(lines)
 
 
+def _dedup_leading_name(stato: str, nome: str) -> str:
+    """Table only: if the prose opens with the client's own name, drop it (plus any
+    immediate separator) and re-capitalize. The bold ``<b>nome</b>`` prefix already
+    shows the name, so repeating it in the row is a doubling (seen in live testing).
+    Exact prefix match: if the model varies the wording ("la signora Rossi") nothing
+    is stripped, which is the safe default."""
+    prose = stato.lstrip()
+    if nome and prose.startswith(nome):
+        prose = prose[len(nome) :].lstrip(" .,:;—-")
+        if prose:
+            prose = prose[0].upper() + prose[1:]
+    return prose
+
+
 def _table_row(entry: ConversationTriage) -> str:
-    # Symbols replace the old "urgenza · presidio · temperatura" triplet (redundant
-    # now). Truncate on the RAW stato first, THEN escape + italic (so we never cut an
-    # entity/tag; an unbalanced ``**`` left by truncation stays literal, not an <i>).
+    # Symbols replace the old "urgenza · presidio · temperatura" triplet. Drop a
+    # leading duplicate of the name (the bold prefix already shows it), then truncate
+    # on the RAW stato, THEN escape + italic. Truncation can cut inside a ``**...**``
+    # pair (e.g. a multi-word marker); the balanced-only regex would leave the stray
+    # ``**`` literal, so we strip any residual marker (seen live: "il suo **parrocchetto…").
     symbols = _table_symbols(entry)
-    stato = _html(_one_line(entry.stato_sintetico))
+    prose = _dedup_leading_name(entry.stato_sintetico, entry.nome)
+    stato = _html(_one_line(prose)).replace("**", "")
     # SEAM T4: a terse memory tag (e.g. " [promessa scaduta]") would be appended here.
     return f"{symbols} <b>{html.escape(entry.nome, quote=False)}</b> — {stato}"
 
