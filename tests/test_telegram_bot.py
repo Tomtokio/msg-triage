@@ -94,9 +94,11 @@ class _FakeEngine:
 class _FakeMessage:
     def __init__(self):
         self.replies: list[str] = []
+        self.parse_modes: list[str | None] = []
 
     async def reply_text(self, text, **kwargs):
         self.replies.append(text)
+        self.parse_modes.append(kwargs.get("parse_mode"))
 
 
 class _FakeUpdate:
@@ -168,6 +170,16 @@ def test_split_message_hard_splits_an_overlong_line():
     assert "".join(chunks) == text
 
 
+def test_split_message_never_cuts_an_html_tag():
+    # A single overlong line with a tag straddling the limit boundary (HTML-safe path).
+    line = "a" * 98 + "<b>x</b>" + "b" * 200
+    chunks = split_message(line, limit=100)
+    for chunk in chunks:
+        lt = chunk.rfind("<")
+        assert lt == -1 or ">" in chunk[lt:]  # no chunk ends inside an unclosed tag
+    assert "".join(chunks) == line  # hard-split stays lossless
+
+
 # --- run_triage_pipeline -------------------------------------------------------
 
 
@@ -209,6 +221,8 @@ def test_deliver_triage_sends_three_distinct_messages():
     assert "SCHEMA" in message.replies[0]
     assert "TABELLA" in message.replies[1]
     assert "VOCALE" in message.replies[2]
+    # Schema and table go out as HTML; the voice stays plain text (no parse_mode).
+    assert message.parse_modes == ["HTML", "HTML", None]
 
 
 # --- triage_command paths ------------------------------------------------------

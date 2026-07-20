@@ -14,8 +14,10 @@ renderers only lay it out — they never re-summarize prose.
                       ``motivo``, non dal paragrafo ``stato_sintetico``) e riassume
                       il resto in una frase di panoramica.
 
-Output is plain text (no Markdown / parse_mode), so the bot needs no escaping. The
-three strings map 1:1 to T7's ``triage_runs`` columns via :class:`RenderedTriage`.
+Schema and table are Telegram HTML (``parse_mode="HTML"``): model-authored text is
+``html.escape``-d FIRST, then OUR ``<b>``/``<i>`` tags and status symbols are added
+around it. The voice stays plain text (no tags, no symbols) for TTS. The three
+strings map 1:1 to T7's ``triage_runs`` columns via :class:`RenderedTriage`.
 
 Memory (T4) seam: memory signals do not exist on the triage object yet. The single
 insertion point is :func:`_memory_clause` (returns ``""`` today); ``render_schema``
@@ -25,6 +27,8 @@ it will compose the Italian delta phrase there. See ``docs/tasks.md`` T4.
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass
 
 from .triage_engine import (
@@ -136,6 +140,61 @@ def _memory_clause(entry: ConversationTriage) -> str:
     return ""
 
 
+# --- Visual markup: HTML + status symbols (schema/table only, never the voice) --
+#
+# Schema and table go out as Telegram HTML. Model-authored text is escaped FIRST,
+# then we wrap OUR tags around it — never the reverse. The species italic comes from
+# a ``**specie**`` marker the model emits (docs/triage_system_prompt.md, "Come
+# scrivere"); the regex matches only balanced ``**`` pairs, so a lone marker stays
+# literal and can never open an ``<i>`` that isn't closed. The voice strips the
+# marker instead (plain text: no tags, no symbols).
+
+_URGENZA_DOT = {
+    Urgenza.EMERGENZA: "🔴",
+    Urgenza.ALTA: "🟠",
+    Urgenza.MEDIA: "🟡",
+    Urgenza.BASSA: "⚪",
+}
+_PRESIDIO_SYMBOL = {Presidio.SCOPERTA: "❗", Presidio.PRESIDIATA: "✅"}
+_TEMPERATURA_SYMBOL = {Temperatura.ALTA: "🔥", Temperatura.MEDIA: "⚠️", Temperatura.BASSA: ""}
+
+_SPECIES_MARKER = re.compile(r"\*\*(.+?)\*\*")  # only balanced pairs -> <i>...</i>
+
+
+def _table_symbols(entry: ConversationTriage) -> str:
+    """Full symbol prefix for a table row: urgency dot + presidio + temperature.
+
+    The temperature symbol is ``""`` for ``bassa`` (calm is the norm — no mark)."""
+    return (
+        _URGENZA_DOT[entry.urgenza]
+        + _PRESIDIO_SYMBOL[entry.presidio]
+        + _TEMPERATURA_SYMBOL[entry.temperatura]
+    )
+
+
+def _schema_symbols(entry: ConversationTriage) -> str:
+    """Lighter prefix for a schema paragraph: urgency dot + only the *attention*
+    marks (❗ if uncovered, 🔥 if hot). No ✅/⚠️ — the schema stays a text to read."""
+    symbols = _URGENZA_DOT[entry.urgenza]
+    if entry.presidio is Presidio.SCOPERTA:
+        symbols += _PRESIDIO_SYMBOL[Presidio.SCOPERTA]
+    if entry.temperatura is Temperatura.ALTA:
+        symbols += _TEMPERATURA_SYMBOL[Temperatura.ALTA]
+    return symbols
+
+
+def _html(raw: str) -> str:
+    """Escape model text for Telegram HTML, then turn the ``**specie**`` marker into
+    ``<i>specie</i>``. Escape first so any ``< > &`` the client typed become entities;
+    our italic tags are added around the already-escaped text."""
+    return _SPECIES_MARKER.sub(r"<i>\1</i>", html.escape(raw, quote=False))
+
+
+def _strip_species_marker(raw: str) -> str:
+    """Drop the ``**`` species marker for the voice (plain text: no tags, no marks)."""
+    return _SPECIES_MARKER.sub(r"\1", raw)
+
+
 # --- SCHEMA: three-level prose, complete giornale di bordo ---------------------
 
 
@@ -163,22 +222,28 @@ def _schema_section(header: str, entries: list[ConversationTriage]) -> str:
 
 
 def _schema_paragraph(entry: ConversationTriage) -> str:
-    parts = [entry.stato_sintetico.strip()]
+    # Nome NON anteposto: resta nella prosa del modello (stato_sintetico). Il
+    # paragrafo apre coi simboli leggeri, poi la prosa (HTML: escape + corsivo specie).
+    parts = [_html(entry.stato_sintetico.strip())]
     clause = _memory_clause(entry)  # SEAM T4: "" today
     if clause:
         parts.append(clause)
     action = _as_sentence(entry.azione_suggerita)  # azione may already end with "."
     if action:
-        parts.append(f"Da fare: {action}")
-    return " ".join(parts)
+        parts.append(f"Da fare: {_html(action)}")
+    return f"{_schema_symbols(entry)} " + " ".join(parts)
 
 
 def _schema_rumore_section(entries: list[ConversationTriage]) -> str:
     if not entries:
         return f"{_H_RUMORE}\n{_EMPTY_GROUP}"
     # Cumulative single line, but keep content: each one's short `motivo`, in parens
-    # so a motivo that itself contains commas stays unambiguous.
-    items = ", ".join(f"{e.nome} ({e.motivo.strip().rstrip('.')})" for e in entries)
+    # so a motivo that itself contains commas stays unambiguous. Name in bold (it is a
+    # real field here), motivo through _html (escape + species italic).
+    items = ", ".join(
+        f"<b>{html.escape(e.nome, quote=False)}</b> ({_html(e.motivo.strip().rstrip('.'))})"
+        for e in entries
+    )
     return f"{_H_RUMORE}\n{items}."
 
 
@@ -208,10 +273,13 @@ def _table_section(header: str, entries: list[ConversationTriage]) -> str:
 
 
 def _table_row(entry: ConversationTriage) -> str:
-    meta = f"{entry.urgenza.value} · {entry.presidio.value} · {entry.temperatura.value}"
-    stato = _one_line(entry.stato_sintetico)
+    # Symbols replace the old "urgenza · presidio · temperatura" triplet (redundant
+    # now). Truncate on the RAW stato first, THEN escape + italic (so we never cut an
+    # entity/tag; an unbalanced ``**`` left by truncation stays literal, not an <i>).
+    symbols = _table_symbols(entry)
+    stato = _html(_one_line(entry.stato_sintetico))
     # SEAM T4: a terse memory tag (e.g. " [promessa scaduta]") would be appended here.
-    return f"{entry.nome} — {meta} — {stato}"
+    return f"{symbols} <b>{html.escape(entry.nome, quote=False)}</b> — {stato}"
 
 
 # --- VOCALE: synthetic, TTS-oriented -------------------------------------------
@@ -238,9 +306,10 @@ def _voice_urgent(subito: list[ConversationTriage]) -> str:
 
 def _voice_item(entry: ConversationTriage) -> str:
     # Voce = sintetico: si legge `motivo` (frase secca di una riga, per costruzione),
-    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Poi l'azione.
-    spoken = _as_sentence(" ".join(entry.motivo.split()))
-    action = entry.azione_suggerita.strip()
+    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Poi l'azione. Il
+    # marcatore `**specie**` va tolto: il vocale è testo pulito (niente tag, niente **).
+    spoken = _as_sentence(_strip_species_marker(" ".join(entry.motivo.split())))
+    action = _strip_species_marker(entry.azione_suggerita.strip())
     if action:
         action = action[:1].upper() + action[1:]
         spoken = f"{spoken} {_as_sentence(action)}"

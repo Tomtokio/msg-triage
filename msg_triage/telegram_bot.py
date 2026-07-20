@@ -74,6 +74,22 @@ def parse_window_hours(arg: str | None) -> float:
     return hours
 
 
+def _safe_cut(line: str, start: int, limit: int) -> int:
+    """How many chars to take from ``line[start:]`` (<= ``limit``) so a hard-split
+    never lands inside an HTML tag.
+
+    If the ``limit``-long slice would end with an unclosed ``<`` (a ``<`` with no
+    ``>`` after it), back the cut up to just before that ``<``. Returns at least 1
+    (falls back to ``limit`` when the ``<`` sits at offset 0) so a pathological
+    >limit tag still makes progress instead of looping forever.
+    """
+    piece = line[start : start + limit]
+    lt = piece.rfind("<")
+    if lt > 0 and piece.find(">", lt) == -1:
+        return lt
+    return limit
+
+
 def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     """Split ``text`` into chunks no longer than ``limit`` characters.
 
@@ -81,6 +97,10 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     ``limit`` is hard-split as a last resort. Never returns an empty list (an empty
     string yields one empty chunk). Needed because the schema/table (full giornale
     di bordo) can exceed Telegram's per-message limit.
+
+    HTML-safe: schema/table go out with ``parse_mode="HTML"``, and every tag pair we
+    emit lives on a single physical line, so the newline path never straddles a pair.
+    The last-resort hard-split uses :func:`_safe_cut` so it never cuts a tag in half.
     """
     if len(text) <= limit:
         return [text]
@@ -89,16 +109,16 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     current = ""
     for line in text.split("\n"):
         if len(line) > limit:
-            # Flush what we have, then hard-split the overlong line.
+            # Flush what we have, then hard-split the overlong line (never mid-tag).
             if current:
                 chunks.append(current)
                 current = ""
-            for i in range(0, len(line), limit):
-                piece = line[i : i + limit]
-                if len(piece) == limit:
-                    chunks.append(piece)
-                else:
-                    current = piece  # remainder seeds the next chunk
+            start = 0
+            while len(line) - start > limit:
+                cut = _safe_cut(line, start, limit)
+                chunks.append(line[start : start + cut])
+                start += cut
+            current = line[start:]  # remainder seeds the next chunk
             continue
         candidate = line if not current else f"{current}\n{line}"
         if len(candidate) <= limit:
@@ -141,16 +161,25 @@ def _hours_label(hours: float) -> str:
 # --- Async handlers (thin glue over the pure core) -----------------------------
 
 
-async def _send(message, text: str) -> None:
-    """Send possibly-long plain text as one or more Telegram messages (no markup)."""
+async def _send(message, text: str, *, parse_mode: str | None = None) -> None:
+    """Send possibly-long text as one or more Telegram messages.
+
+    ``parse_mode`` is forwarded to Telegram (``"HTML"`` for schema/table, ``None``
+    for the plain voice). ``split_message`` keeps HTML tags intact across chunk
+    boundaries, so every chunk is independently valid markup.
+    """
     for chunk in split_message(text):
-        await message.reply_text(chunk)
+        await message.reply_text(chunk, parse_mode=parse_mode)
 
 
 async def _deliver_triage(message, rendered: RenderedTriage) -> None:
-    """Send the three formats as three distinct plain-text messages (each chunked)."""
-    await _send(message, f"📋 SCHEMA\n\n{rendered.schema_text}")
-    await _send(message, f"🧾 TABELLA\n\n{rendered.table_text}")
+    """Send the three formats as three distinct messages (each chunked).
+
+    Schema and table are HTML (bold names, italic species, status symbols); the
+    voice stays plain text so no markup is spoken or leaks into the audio path.
+    """
+    await _send(message, f"📋 SCHEMA\n\n{rendered.schema_text}", parse_mode="HTML")
+    await _send(message, f"🧾 TABELLA\n\n{rendered.table_text}", parse_mode="HTML")
     # SEAM T6: when the TTS lands, the "vocale" becomes an audio file here instead
     # of text; nothing else in the pipeline changes.
     await _send(message, f"🔊 VOCALE\n\n{rendered.vocal_text}")
