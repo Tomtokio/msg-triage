@@ -6,10 +6,15 @@ simplest style in the suite (mirrors tests/test_triage_engine.py).
 """
 
 from msg_triage.renderers import (
+    _PRESIDIO_SYMBOL,
+    _TEMPERATURA_SYMBOL,
+    _URGENZA_DOT,
     RenderedTriage,
     _bucket,
     _memory_clause,
     _one_line,
+    _schema_symbols,
+    _table_symbols,
     render_all,
     render_schema,
     render_table,
@@ -117,7 +122,7 @@ def test_schema_keeps_stato_verbatim_table_collapses_and_truncates():
     r = _result(_entry(gruppo=Gruppo.IN_CORSO, stato_sintetico=long_stato))
     assert long_stato.strip() in render_schema(r)  # verbatim, newlines preserved
 
-    row = next(l for l in render_table(r).splitlines() if l.startswith("Sig.ra Rossi"))
+    row = next(l for l in render_table(r).splitlines() if "Sig.ra Rossi" in l)
     assert "\n" not in row
     assert row.endswith("…")
 
@@ -152,12 +157,15 @@ def test_schema_azione_no_double_period():
     assert ".." not in schema
 
 
-def test_schema_rumore_keeps_motivo_in_one_cumulative_line():
+def test_schema_rumore_bolds_name_keeps_motivo_in_one_cumulative_line():
     r = _result(
         _entry(gruppo=Gruppo.RUMORE, nome="Blu", motivo="chiedeva gli orari"),
         _entry(gruppo=Gruppo.RUMORE, nome="Verde", contact_id="c2", motivo="animale trovato, alla Lipu"),
     )
-    assert "RUMORE DI FONDO\nBlu (chiedeva gli orari), Verde (animale trovato, alla Lipu)." in render_schema(r)
+    assert (
+        "RUMORE DI FONDO\n<b>Blu</b> (chiedeva gli orari), <b>Verde</b> (animale trovato, alla Lipu)."
+        in render_schema(r)
+    )
 
 
 # --- Memory seam (T4): silent today --------------------------------------------
@@ -187,17 +195,131 @@ def test_no_memory_phrases_rendered_today():
 # --- TABELLA -------------------------------------------------------------------
 
 
-def test_table_has_one_row_per_conversation_with_enums():
+def test_table_row_has_symbols_bold_name_and_no_enum_triplet():
     r = _result(
         _entry(gruppo=Gruppo.SUBITO, nome="S", urgenza=Urgenza.ALTA, presidio=Presidio.SCOPERTA, temperatura=Temperatura.MEDIA),
-        _entry(gruppo=Gruppo.IN_CORSO, nome="I"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="I"),  # media / presidiata / bassa (defaults)
         _entry(gruppo=Gruppo.RUMORE, nome="R"),
     )
     table = render_table(r)
-    assert "S — alta · scoperta · media — " in table
-    assert "I — media · presidiata · bassa — " in table
-    assert "R — media · presidiata · bassa — " in table
+    sym_s = (
+        _URGENZA_DOT[Urgenza.ALTA]
+        + _PRESIDIO_SYMBOL[Presidio.SCOPERTA]
+        + _TEMPERATURA_SYMBOL[Temperatura.MEDIA]
+    )
+    sym_default = (
+        _URGENZA_DOT[Urgenza.MEDIA]
+        + _PRESIDIO_SYMBOL[Presidio.PRESIDIATA]
+        + _TEMPERATURA_SYMBOL[Temperatura.BASSA]
+    )
+    assert f"{sym_s} <b>S</b> — " in table
+    assert f"{sym_default} <b>I</b> — " in table
+    assert f"{sym_default} <b>R</b> — " in table
+    assert "·" not in table  # the "urgenza · presidio · temperatura" triplet is gone
     assert len([l for l in table.splitlines() if " — " in l]) == 3
+
+
+def test_table_strips_leading_client_name_from_prose():
+    r = _result(
+        _entry(
+            gruppo=Gruppo.IN_CORSO,
+            nome="Sig.ra Rossi",
+            stato_sintetico="Sig.ra Rossi chiede quando è pronta la ricetta.",
+        )
+    )
+    row = next(l for l in render_table(r).splitlines() if "<b>Sig.ra Rossi</b>" in l)
+    assert row.count("Sig.ra Rossi") == 1  # only in the bold prefix, not doubled in prose
+    assert "<b>Sig.ra Rossi</b> — Chiede quando" in row
+    # Schema is untouched: the name stays wherever the model wove it into the prose.
+    assert "Sig.ra Rossi chiede" in render_schema(r)
+
+
+def test_table_keeps_prose_when_name_is_not_leading():
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", stato_sintetico="La signora Bianchi aspetta conferma.")
+    )
+    row = next(l for l in render_table(r).splitlines() if "<b>Bianchi</b>" in l)
+    assert "La signora Bianchi aspetta" in row  # not stripped: the name is mid-sentence
+
+
+def test_table_strips_stray_marker_left_by_truncation():
+    # A multi-word species marker cut mid-pair by the 80-char truncation.
+    stato = ("parola " * 9) + "**parrocchetto australiano** che sta male"
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Z", stato_sintetico=stato))
+    row = next(l for l in render_table(r).splitlines() if "<b>Z</b>" in l)
+    assert "**" not in row  # the stray opening marker is removed
+    assert row.endswith("…")  # the row was truncated
+
+
+# --- HTML markup: escaping, italic species, status symbols ---------------------
+
+
+def test_html_escaping_of_dynamic_text_in_schema_and_table():
+    r = _result(
+        _entry(
+            gruppo=Gruppo.SUBITO,
+            nome="Rossi & <Co>",
+            urgenza=Urgenza.ALTA,
+            presidio=Presidio.SCOPERTA,
+            stato_sintetico="dubbio su <dosaggio> & tempi",
+        )
+    )
+    schema = render_schema(r)
+    table = render_table(r)
+    # Client/model text is escaped; raw angle brackets/ampersands never reach output.
+    assert "&lt;dosaggio&gt;" in schema and "&amp;" in schema
+    assert "<dosaggio>" not in schema
+    # The name is a real field in the table row: escaped inside our <b> tag.
+    assert "<b>Rossi &amp; &lt;Co&gt;</b>" in table
+    assert "&lt;dosaggio&gt;" in table
+
+
+def test_species_marker_becomes_italic_in_schema_and_table():
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", stato_sintetico="la **tartaruga** Ruga non mangia")
+    )
+    schema = render_schema(r)
+    table = render_table(r)
+    assert "<i>tartaruga</i>" in schema and "<i>tartaruga</i>" in table
+    assert "**" not in schema and "**" not in table
+
+
+def test_no_species_marker_leaves_no_italic():
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, stato_sintetico="nessuna specie da marcare qui"))
+    assert "<i>" not in render_schema(r)
+    assert "<i>" not in render_table(r)
+
+
+def test_table_symbols_map_every_enum_value():
+    # Urgency dot: always present, one per value.
+    for urgenza, dot in _URGENZA_DOT.items():
+        e = _entry(gruppo=Gruppo.IN_CORSO, urgenza=urgenza, presidio=Presidio.PRESIDIATA, temperatura=Temperatura.BASSA)
+        assert _table_symbols(e) == dot + _PRESIDIO_SYMBOL[Presidio.PRESIDIATA] + _TEMPERATURA_SYMBOL[Temperatura.BASSA]
+    # Presidio: both values map to their symbol.
+    for presidio in Presidio:
+        e = _entry(gruppo=Gruppo.IN_CORSO, presidio=presidio, temperatura=Temperatura.BASSA)
+        assert _PRESIDIO_SYMBOL[presidio] in _table_symbols(e)
+    # Temperature: hot/warm add a trailing symbol, calm adds nothing.
+    assert _TEMPERATURA_SYMBOL[Temperatura.BASSA] == ""
+    for temp in (Temperatura.ALTA, Temperatura.MEDIA):
+        e = _entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.PRESIDIATA, temperatura=temp)
+        assert _table_symbols(e).endswith(_TEMPERATURA_SYMBOL[temp])
+
+
+def test_temperatura_bassa_adds_no_temperature_symbol():
+    e = _entry(gruppo=Gruppo.IN_CORSO, urgenza=Urgenza.MEDIA, presidio=Presidio.SCOPERTA, temperatura=Temperatura.BASSA)
+    assert _table_symbols(e) == _URGENZA_DOT[Urgenza.MEDIA] + _PRESIDIO_SYMBOL[Presidio.SCOPERTA]
+
+
+def test_schema_symbols_are_lighter_than_table():
+    # presidiata + warm(media): the schema shows only the urgency dot (no ✅, no ⚠️).
+    calm = _entry(gruppo=Gruppo.IN_CORSO, urgenza=Urgenza.MEDIA, presidio=Presidio.PRESIDIATA, temperatura=Temperatura.MEDIA)
+    assert _schema_symbols(calm) == _URGENZA_DOT[Urgenza.MEDIA]
+    # scoperta + hot: dot + attention marks ❗ and 🔥.
+    hot = _entry(gruppo=Gruppo.SUBITO, urgenza=Urgenza.ALTA, presidio=Presidio.SCOPERTA, temperatura=Temperatura.ALTA)
+    assert _schema_symbols(hot) == (
+        _URGENZA_DOT[Urgenza.ALTA] + _PRESIDIO_SYMBOL[Presidio.SCOPERTA] + _TEMPERATURA_SYMBOL[Temperatura.ALTA]
+    )
 
 
 # --- VOCALE --------------------------------------------------------------------
@@ -245,6 +367,29 @@ def test_voice_flags_uncovered_in_panoramica():
         _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2", presidio=Presidio.PRESIDIATA),
     )
     assert "una ancora scoperta" in render_voice(r)
+
+
+def test_voice_stays_plain_strips_marker_no_tags_no_symbols():
+    r = _result(
+        _entry(
+            gruppo=Gruppo.SUBITO,
+            nome="Verdi",
+            urgenza=Urgenza.ALTA,
+            presidio=Presidio.SCOPERTA,
+            temperatura=Temperatura.ALTA,
+            motivo="la **tartaruga** è bloccata in farmacia",
+            azione_suggerita="chiamare la farmacia",
+        ),
+        _entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.SCOPERTA),
+    )
+    voice = render_voice(r)
+    assert "**" not in voice  # species marker stripped for the spoken text
+    assert "<i>" not in voice and "<b>" not in voice
+    symbols = set(_URGENZA_DOT.values()) | set(_PRESIDIO_SYMBOL.values()) | set(_TEMPERATURA_SYMBOL.values())
+    for symbol in symbols:
+        if symbol:  # skip the empty temperatura-bassa marker
+            assert symbol not in voice
+    assert "tartaruga" in voice  # the species word survives, just unmarked
 
 
 # --- Helpers, container, determinism -------------------------------------------

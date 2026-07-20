@@ -86,6 +86,9 @@ loro lavoro, cambierebbe il clima. Inserire questo vincolo nero su bianco nel sy
 - NON esporre chiavi lato client. Tutto sul backend Hetzner.
 - NON renderizzare tabelle ricche su Telegram (monospace fragile su mobile). Testo semplice.
   La tabella "vera" è feature del v1 con la PWA.
+- Emoji DECORATIVE no; INDICATORI SEMANTICI di stato sì. I pallini urgenza (🔴🟠🟡⚪),
+  presidio (❗/✅) e temperatura (🔥/⚠️) in schema e tabella comunicano lo stato a colpo
+  d'occhio, non decorano. Il vocale resta pulito (nessun simbolo, nessun tag).
 - NON fidarsi di tag/note come unica verità (uso irregolare).
 - NON far rispondere il bot a chiunque: whitelist obbligatoria sull'ID Telegram.
 - NON mandare un blocco unico: schema, tabella, vocale = tre messaggi distinti.

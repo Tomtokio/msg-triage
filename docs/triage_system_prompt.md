@@ -109,6 +109,8 @@ Apri sempre dal gruppo più urgente. Se un gruppo è vuoto, dillo in una riga e 
 
 Nomina le persone e gli animali quando li conosci: "la signora Bianchi", "il coniglio", "il pappagallo del signor Neri". Servono al responsabile per orientarsi.
 
+Racchiudi tra doppi asterischi la **specie** dell'animale ogni volta che la nomini: scrivi "la **tartaruga** Ruga", "una **pappagallina**", "il **pappagallo** del signor Neri". Marca solo la specie — non il nome proprio dell'animale, non il nome del cliente. Se in una voce non c'è una specie da nominare, non marcare nulla: va benissimo così.
+
 Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia dal contenuto.
 
 ---
