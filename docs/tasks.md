@@ -69,20 +69,28 @@ Converte il testo "vocale" di T5 in file audio (ogg/mp3) per Telegram.
 **Completamento:** dato il testo vocale, ritorna un file audio valido.
 **Dipendenze:** T5. Può procedere con uno stub mentre si decide.
 
-## T7 — Persistenza + schema memoria (Supabase)
-Schema che serve SIA lo storico SIA la memoria.
+## T7 — Persistenza + schema memoria + ciclo di vita proposte (Supabase)
+Schema che serve TRE padroni: storico, memoria tra run, e le proposte/tag di T10.
+Progettare la migration COMPLETA in una volta (la applica Tommaso a mano).
 - Tabella triage_runs: id, created_at, finestra_ore, n_conversazioni, schema_text,
   table_text, vocal_text
 - Tabella conversation_states: id, run_id (fk), contact_id (INDICIZZATO), nome, gruppo,
-  presidio, urgenza, temperatura, stato_sintetico, last_message_at,
-  promessa_testo (nullable), promessa_scadenza_stimata (nullable)
+  presidio, urgenza, temperatura, stato_sintetico, specie (nullable — alimenta
+  l'autosufficienza delle voci quando la specie è nei messaggi vecchi fuori finestra),
+  last_message_at, promessa_testo (nullable), promessa_scadenza_stimata (nullable)
   → è questa tabella che abilita la MEMORIA: al run successivo si interroga per contact_id
+- Tabella proposals (per T10): id, created_at, contact_id, tipo (tag_add/tag_remove/
+  rename), payload, motivo, stato (pending/approvata/rifiutata/eseguita/fallita),
+  matures_at (nullable, per le proposte programmate), executed_at, telegram_message_id
+- Tabella system_tags (per T10): contact_id, tag, applied_at, proposta_id
+  → il ciclo di vita dei tag richiede di sapere quando e perché un tag è stato messo
 - Due concetti di tempo: last_message_at (quando visto l'ultimo msg) e
   promessa_scadenza_stimata (quando era attesa risposta, se rilevata)
 - Salvataggio dopo ogni run
 - RLS / accesso ristretto (contiene nomi reali)
-**Completamento:** ogni run scrive run + stati per conversazione; interrogabile per contact_id.
-**Dipendenze:** T1. (T4 dipende da questo schema — svilupparli coordinati.)
+**Completamento:** ogni run scrive run + stati per conversazione; interrogabile per
+contact_id; le tabelle di T10 esistono e sono pronte.
+**Dipendenze:** T1. (T4 e T10 dipendono da questo schema.)
 
 ## T8 — Bot Telegram (orchestrazione)
 Interfaccia di comando e consegna.
@@ -99,3 +107,20 @@ Interfaccia di comando e consegna.
 - (Opzionale) cron per un /triage automatico a orari fissi in push
 **Completamento:** il bot gira stabile come servizio.
 **Dipendenze:** T8.
+
+## T10 — Azioni organizzative con conferma (proposte: tag + rinomina)
+Vedi prompt dedicato (prompt-t10-proposte.md). In sintesi: il triage estrae fatti di
+stato dal testo (stessa chiamata LLM); regole deterministiche generano PROPOSTE
+(aggiungi/rimuovi tag del set chiuso, rinomina contatto secondo convenzione); ogni
+proposta arriva su Telegram con bottoni ✅/❌; solo alla conferma il codice scrive su
+Callbell. Set chiuso v1: ricoverato / dimissione-oggi / triage-urgente, ognuno con la
+propria regola di ciclo di vita. Tag delle colleghe intoccabili. Controllo di coerenza
+al risveglio delle conversazioni dormienti (anti-fossile). Multi-animale → nome = solo
+proprietario.
+**Completamento:** le proposte arrivano, i tap eseguono, il DB traccia il ciclo completo.
+**Dipendenze:** T9 (bot sempre attivo), T7 (tabelle proposals + system_tags).
+
+## Ordine di lavoro aggiornato (post-V0)
+PR rumore → T9 (systemd VPS + cron opzionale) → T7 (migration completa) → T10 (proposte)
+→ T4 (memoria, si aggancia allo schema già pronto) → T6 (audio via Leggo AI, quando
+verificato l'endpoint).
