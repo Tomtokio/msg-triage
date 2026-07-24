@@ -1,0 +1,57 @@
+# msg-triage.service — VetTriage v0, bot Telegram di triage Callbell/WhatsApp.
+#
+# Deploy manuale (lo fa Tommaso). Copiare in /etc/systemd/system/ e:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now msg-triage
+# Procedura completa e troubleshooting: docs/runbook.md
+#
+# I segreti NON stanno in questa unit: l'app carica da sé il file
+# /home/msgtriage/msg-triage/.env (python-dotenv, override=False, path ancorato al
+# package). Ogni modifica a .env richiede un restart: la config si legge solo allo
+# startup.
+
+[Unit]
+Description=VetTriage — bot Telegram di triage Callbell/WhatsApp (msg-triage)
+After=network-online.target
+Wants=network-online.target
+# Config errata (segreti mancanti) => l'app esce con codice 1. Questi limiti evitano
+# il crash-loop infinito: dopo 5 fallimenti in 300s il servizio va in stato "failed"
+# (fallimento rumoroso, visibile in `systemctl status`).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=msgtriage
+# Group deve combaciare col gruppo primario reale dell'utente msgtriage.
+Group=msgtriage
+WorkingDirectory=/home/msgtriage/msg-triage
+
+# ATTENZIONE: il "-m" deve essere un trattino ASCII, NON un em-dash "—".
+# Un em-dash da copia-incolla impedisce l'avvio del servizio (è già successo).
+ExecStart=/home/msgtriage/msg-triage/.venv/bin/python -m msg_triage
+# Equivalente senza "-m" (azzera del tutto il rischio em-dash), se preferito:
+#   ExecStart=/home/msgtriage/msg-triage/.venv/bin/msg-triage
+
+# on-failure (non always): uno stop pulito (SIGTERM => exit 0) NON deve riavviare;
+# un crash sì. python-telegram-bot gestisce da sé SIGTERM/SIGINT e chiude il long
+# polling in modo ordinato, quindi `systemctl stop` termina pulito.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening minimo e compatibile col deploy in home directory.
+# NB: NIENTE ProtectHome=true — nasconderebbe /home/msgtriage (repo, venv, .env).
+NoNewPrivileges=true
+PrivateTmp=true
+# Hardening opzionale più stretto: abilitare e testare DOPO il primo avvio pulito.
+# L'app non scrive nulla a runtime e fa solo HTTPS in uscita (Callbell, Anthropic,
+# Telegram), nessuna porta in ascolto.
+#ProtectSystem=strict
+#ProtectKernelTunables=true
+#ProtectControlGroups=true
+#RestrictAddressFamilies=AF_INET AF_INET6
+#LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
