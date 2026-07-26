@@ -57,7 +57,7 @@ class Gruppo(str, Enum):
 
 
 class Urgenza(str, Enum):
-    """Clinical urgency, read through the exotics/avian filter."""
+    """How soon it must be handled — a time window, not clinical severity."""
 
     EMERGENZA = "emergenza"
     ALTA = "alta"
@@ -216,7 +216,7 @@ def build_output_schema() -> dict:
             "ref": {"type": "integer", "description": "Il numero [n] della conversazione in input."},
             "gruppo": {"type": "string", "enum": _GRUPPO_VALUES, "description": "Il gruppo di triage."},
             "motivo": {"type": "string", "description": "Perché è in questo gruppo, in breve."},
-            "urgenza": {"type": "string", "enum": _URGENZA_VALUES, "description": "Urgenza clinica (filtro esotici/aviari)."},
+            "urgenza": {"type": "string", "enum": _URGENZA_VALUES, "description": "Entro quando va gestita: emergenza (minuti) / alta (poche ore) / media (in giornata) / bassa (può aspettare domani)."},
             "presidio": {"type": "string", "enum": _PRESIDIO_VALUES, "description": "presidiata se qualcuno la sta gestendo, altrimenti scoperta."},
             "temperatura": {"type": "string", "enum": _TEMPERATURA_VALUES, "description": "Temperatura emotiva del proprietario."},
             "stato_sintetico": {

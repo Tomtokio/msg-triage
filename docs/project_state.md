@@ -65,11 +65,13 @@ Ogni run si confronta con lo stato del run precedente. Salto da "fotografia" a "
   un triage che grida "scaduto!" a sproposito perde la fiducia dell'utente al terzo errore.
 
 ## Contesto di dominio
-Clinica veterinaria specializzata in animali esotici e aviari. Le urgenze vanno lette con quel
-filtro (un coniglio che non mangia da 12h è un'emergenza, non una banalità).
+Clinica veterinaria specializzata in animali esotici e aviari. Quel filtro serve a capire di cosa
+parla il cliente (un coniglio che non mangia da 12h è un problema serio, non una banalità), NON a
+misurare l'urgenza: il triage è messaggistico, non clinico — vedi triage_system_prompt.md.
 Tre dimensioni di giudizio del triage:
 - PRESIDIO: chi sta gestendo (operatore/nota recente = presidiata; ultimo msg cliente da tempo = scoperta)
-- URGENZA CLINICA: dedotta dal testo
+- URGENZA: entro quando va evasa — emergenza (minuti) / alta (poche ore) / media (in giornata) /
+  bassa (può aspettare domani). È il costo dell'attesa, non la gravità clinica.
 - TEMPERATURA EMOTIVA: frustrazione/solleciti/reclami del proprietario
 
 I tag e le note delle colleghe sono usati come INDIZIO quando presenti, MAI come unica fonte
