@@ -37,11 +37,22 @@ Sono cose diverse, e spesso vanno in direzioni opposte. Un signore fermo in farm
 
 Chiediti sempre: **cosa succede se nessuno risponde per due ore?** Se la risposta è "niente, il cliente aspetta" → è routine, per quanto commovente sia il caso. Se la risposta è "il cliente resta bloccato, perde la visita, o il problema si aggrava per colpa nostra" → è urgente, per quanto banale sia clinicamente.
 
-Due cose meritano **SUBITO**:
+La stessa domanda, fatta con orologi diversi, ti dà anche il livello: **emergenza**, **alta**, **media**, **bassa** non misurano quanto la cosa è grave, misurano **entro quando** va gestita. Non sono gradi di drammaticità, sono finestre di tempo. Prima di scegliere, dì a te stesso entro quando quella cosa dev'essere risolta: il livello nasce da lì, non dall'impressione che ti fa il caso.
+
+**Emergenza** è adesso, entro pochi minuti: è rara, e nella pratica ci finisce quasi soltanto ciò che è già da gestire subito. **Alta** è quando la finestra si chiude entro poche ore — un appuntamento chiesto per oggi, una decisione che il cliente non può prendere senza di noi e non può rimandare a domani ("gli do la seconda dose stasera o aspetto?"). **Media** è quello che va gestito in giornata ma senza nessuna finestra che si chiude: ci vivono quasi tutte le domande cliniche e i dubbi sulle terapie, dove non si perde niente se la risposta arriva fra tre ore invece che fra una. **Bassa** è quello che può aspettare domani senza conseguenze.
+
+Attenzione a un errore che ricorre: **una conversazione conclusa è sempre bassa**. Appuntamento fissato, cliente che ha ringraziato, niente in sospeso — "fissato alle 16:00, il cliente ha ringraziato, concluso" non è media, è bassa. Quello che è già stato fatto non può essere urgente: non c'è nessuna finestra aperta, si è chiusa bene. Vale allo stesso modo per tutto ciò che finisce nel rumore di fondo — un animale trovato, una conversazione dove ha scritto soltanto la clinica, una domanda sugli orari: lì non c'è più niente in attesa, e il livello resta **bassa**.
+
+E quando sei in bilico fra due livelli, **prendi sempre il più basso**. Gonfiare l'urgenza dappertutto è il modo più rapido per rendere il campo inutile: se quasi tutto è medio o alto, chi legge smette di guardarlo.
+
+Livello e gruppo restano comunque due giudizi **separati**: alzare l'urgenza non promuove niente. Una conversazione può vivere in "in corso" ed essere alta — la domanda sulla terapia che il cliente deve applicare stasera va risposta oggi, ma non è un allarme. E si finisce in "da gestire subito" per quello che è successo, non per il livello assegnato.
+
+Tre cose meritano **SUBITO**:
 1. **Errore o attrito nostro** — ricetta sbagliata, appuntamento saltato, cliente bloccato per qualcosa che abbiamo fatto o non fatto. Il cliente sta pagando un costo per un nostro inciampo.
 2. **Appuntamento richiesto per oggi che rischia di andare perso** — chi chiede "c'è spazio oggi?" e non riceve risposta, oggi non viene più. La finestra si chiude da sola.
+3. **Il proprietario che si sta arrabbiando davvero** — non l'ansia per il proprio animale, ma l'irritazione verso di noi: solleciti ripetuti, tono che si irrigidisce. Lì la finestra che si chiude è la fiducia.
 
-Tutto il resto — domande cliniche, dubbi sulle terapie, aggiornamenti, richieste di informazioni — va risposto, ma **non urge**. Vive in "in corso".
+Tutto il resto — domande cliniche, dubbi sulle terapie, aggiornamenti, richieste di informazioni — va risposto, ma **non è da gestire subito**. Vive in "in corso".
 
 **Temperatura emotiva** — come sta il proprietario *verso di noi*. Solleciti ripetuti, tono che si irrigidisce, frustrazione, lamentela.
 
@@ -138,3 +149,30 @@ Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia da
 - Da osservare ai prossimi giri: se il modello continua ad appiattire la temperatura; se la
   regola "ho trovato" produce falsi negativi (un cliente abituale che usa quella formula per
   un proprio animale).
+- **Tarato sui dati reali il 26/07/2026** (due run a 11 minuti di distanza, stesse
+  conversazioni). Osservato: il gruppo restava stabile, l'urgenza no — quasi tutte bassa nel
+  primo run, quasi tutte media nel secondo, sugli stessi identici messaggi. Causa: il prompt
+  diceva cosa merita SUBITO ma non ha mai detto cosa distingue emergenza / alta / media /
+  bassa fra loro; in quel vuoto il modello improvvisava una scala diversa a ogni giro. Caso
+  più netto: una conversazione descritta come "fissato alle 16:00, cliente ha ringraziato,
+  concluso" marcata media — il giudizio contraddiceva la propria descrizione. Concausa: la
+  descrizione del campo urgenza nello schema JSON diceva "Urgenza clinica (filtro esotici/
+  aviari)" e viaggiava nella stessa richiesta del prompt che dice "non è un triage clinico".
+- Cambiamenti della seconda taratura: (1) i quattro livelli sono ancorati a una finestra
+  temporale verificabile — ENTRO QUANDO va gestita, non quanto è grave: emergenza = minuti,
+  alta = poche ore, media = in giornata senza finestra che si chiude, bassa = può aspettare
+  domani; (2) conversazione conclusa (appuntamento fissato, cliente che ringrazia, niente in
+  sospeso) → sempre bassa: ciò che è già fatto non può essere urgente; (3) tutto ciò che
+  finisce in rumore di fondo → bassa (il renderer nasconde comunque i simboli sulle voci di
+  rumore, ma il giudizio salvato deve restare coerente); (4) nel dubbio fra due livelli si
+  prende il più basso; (5) livello e gruppo si giudicano separatamente — alzare l'urgenza non
+  promuove nulla in SUBITO, e una "in corso" può legittimamente essere alta; (6) allineati a
+  TRE i casi che meritano SUBITO (il blocco Urgenza ne dichiarava due, "I tre gruppi" tre) e
+  riallineate alla finestra temporale la descrizione del campo urgenza nello schema JSON, il
+  docstring dell'enum Urgenza e il contesto di dominio in project_state.md.
+- Da osservare ai prossimi giri: se l'urgenza regge il test di ripetizione (rilanciare il
+  triage a pochi minuti di distanza sulle stesse conversazioni: i livelli devono coincidere —
+  è il controllo di regressione naturale, va fatto a ogni modifica del blocco urgenza); se la
+  spinta verso il basso appiattisce tutto su bassa, che sarebbe lo stesso guasto della
+  temperatura ma dall'altro lato; se compaiono alta dentro "in corso" senza che il modello le
+  promuova a SUBITO (comportamento atteso e corretto).
