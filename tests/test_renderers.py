@@ -7,6 +7,7 @@ simplest style in the suite (mirrors tests/test_triage_engine.py).
 
 from msg_triage.renderers import (
     _PRESIDIO_SYMBOL,
+    _RUMORE_DOT,
     _TEMPERATURA_SYMBOL,
     _URGENZA_DOT,
     RenderedTriage,
@@ -157,15 +158,68 @@ def test_schema_azione_no_double_period():
     assert ".." not in schema
 
 
-def test_schema_rumore_bolds_name_keeps_motivo_in_one_cumulative_line():
+def test_schema_rumore_merges_names_sharing_one_motivo():
+    # The output schema forces one entry per conversation, so the model cannot merge
+    # three identical "Conversazione chiusa" (seen live): the renderer must.
     r = _result(
-        _entry(gruppo=Gruppo.RUMORE, nome="Blu", motivo="chiedeva gli orari"),
-        _entry(gruppo=Gruppo.RUMORE, nome="Verde", contact_id="c2", motivo="animale trovato, alla Lipu"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Miri", motivo="Conversazione chiusa"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Angelica", contact_id="c2", motivo="Chiarimento concluso"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Paolo Tosi", contact_id="c3", motivo="Conversazione chiusa"),
     )
+    # Group and name order = first appearance: "Conversazione chiusa" opens even though
+    # Angelica's entry came second, and Paolo joins Miri on that line.
     assert (
-        "RUMORE DI FONDO\n<b>Blu</b> (chiedeva gli orari), <b>Verde</b> (animale trovato, alla Lipu)."
-        in render_schema(r)
+        "RUMORE DI FONDO\n"
+        "⚪ <b>Miri</b>, <b>Paolo Tosi</b>: Conversazione chiusa.\n"
+        "⚪ <b>Angelica</b>: Chiarimento concluso."
+    ) in render_schema(r)
+
+
+def test_schema_rumore_dedup_ignores_trailing_period_and_padding():
+    # The model varies the final period between entries; the key normalizes it away.
+    r = _result(
+        _entry(gruppo=Gruppo.RUMORE, nome="A", motivo="conversazione chiusa."),
+        _entry(gruppo=Gruppo.RUMORE, nome="B", contact_id="c2", motivo=" conversazione chiusa "),
     )
+    schema = render_schema(r)
+    assert "⚪ <b>A</b>, <b>B</b>: conversazione chiusa." in schema
+    assert len([l for l in schema.splitlines() if l.startswith(_RUMORE_DOT)]) == 1
+
+
+def test_schema_rumore_case_variance_is_not_merged():
+    # Deliberate: the key is not casefolded. The key IS the printed text, so folding it
+    # would force picking an arbitrary casing to display; the cost of a miss is one
+    # extra line carrying fully correct content.
+    r = _result(
+        _entry(gruppo=Gruppo.RUMORE, nome="A", motivo="Conversazione chiusa"),
+        _entry(gruppo=Gruppo.RUMORE, nome="B", contact_id="c2", motivo="conversazione chiusa"),
+    )
+    assert len([l for l in render_schema(r).splitlines() if l.startswith(_RUMORE_DOT)]) == 2
+
+
+def test_schema_rumore_line_ends_with_exactly_one_sentence_mark():
+    # The key strips the model's erratic period and _as_sentence re-adds exactly one;
+    # ?/! survive, and a motivo that normalizes to nothing leaves the names alone.
+    r = _result(
+        _entry(gruppo=Gruppo.RUMORE, nome="A", motivo="chiedeva gli orari."),
+        _entry(gruppo=Gruppo.RUMORE, nome="B", contact_id="c2", motivo="riaprite sabato?"),
+        _entry(gruppo=Gruppo.RUMORE, nome="C", contact_id="c3", motivo="."),
+    )
+    schema = render_schema(r)
+    assert "⚪ <b>A</b>: chiedeva gli orari." in schema
+    assert "⚪ <b>B</b>: riaprite sabato?" in schema
+    assert "⚪ <b>C</b>." in schema  # no dangling ": ."
+    assert ".." not in schema and "?." not in schema
+
+
+def test_schema_rumore_escapes_names_and_italicizes_species():
+    r = _result(
+        _entry(gruppo=Gruppo.RUMORE, nome="Blu & <Co>", motivo="**passerotto** trovato, alla Lipu")
+    )
+    schema = render_schema(r)
+    assert "<b>Blu &amp; &lt;Co&gt;</b>" in schema
+    assert "<i>passerotto</i> trovato, alla Lipu." in schema  # period lands outside </i>
+    assert "**" not in schema
 
 
 # --- Memory seam (T4): silent today --------------------------------------------
@@ -214,9 +268,30 @@ def test_table_row_has_symbols_bold_name_and_no_enum_triplet():
     )
     assert f"{sym_s} <b>S</b> — " in table
     assert f"{sym_default} <b>I</b> — " in table
-    assert f"{sym_default} <b>R</b> — " in table
+    assert f"{_RUMORE_DOT} <b>R</b> — " in table  # rumore: neutral dot only
     assert "·" not in table  # the "urgenza · presidio · temperatura" triplet is gone
     assert len([l for l in table.splitlines() if " — " in l]) == 3
+
+
+def test_table_rumore_row_carries_only_the_neutral_dot():
+    # Rumore needs no action and the model fills urgenza/presidio/temperatura unreliably
+    # there (live: ❗ on a chat with zero client messages) — the row must not show them.
+    noisy = _entry(
+        gruppo=Gruppo.RUMORE,
+        nome="R",
+        urgenza=Urgenza.ALTA,
+        presidio=Presidio.SCOPERTA,
+        temperatura=Temperatura.ALTA,
+    )
+    assert _table_symbols(noisy) == _RUMORE_DOT
+    row = next(l for l in render_table(_result(noisy)).splitlines() if "<b>R</b>" in l)
+    assert row.startswith(f"{_RUMORE_DOT} <b>R</b> — ")
+    for symbol in (
+        _URGENZA_DOT[Urgenza.ALTA],
+        _PRESIDIO_SYMBOL[Presidio.SCOPERTA],
+        _TEMPERATURA_SYMBOL[Temperatura.ALTA],
+    ):
+        assert symbol not in row
 
 
 def test_table_strips_leading_client_name_from_prose():

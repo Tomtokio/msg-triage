@@ -14,6 +14,10 @@ renderers only lay it out — they never re-summarize prose.
                       ``motivo``, non dal paragrafo ``stato_sintetico``) e riassume
                       il resto in una frase di panoramica.
 
+Both HTML formats treat RUMORE as a group rather than as conversations: it requires no
+action, so it carries one neutral ⚪ and none of the presidio/temperatura marks (the
+model fills those unreliably there), and the schema merges the names sharing a ``motivo``.
+
 Schema and table are Telegram HTML (``parse_mode="HTML"``): model-authored text is
 ``html.escape``-d FIRST, then OUR ``<b>``/``<i>`` tags and status symbols are added
 around it. The voice stays plain text (no tags, no symbols) for TTS. The three
@@ -93,8 +97,9 @@ def _bucket(
     """Split into ``(subito, in_corso, rumore)``.
 
     ``subito``/``in_corso`` are sorted by ``(urgenza, presidio, temperatura)``;
-    Python's stable sort preserves model order for equal keys. ``rumore`` keeps
-    model order (it collapses to one line, so order is irrelevant).
+    Python's stable sort preserves model order for equal keys. ``rumore`` keeps model
+    order because that order is visible: the schema groups it by ``motivo``, and both
+    the groups and the names inside one follow first appearance.
     """
     subito = [e for e in result.conversations if e.gruppo is Gruppo.SUBITO]
     in_corso = [e for e in result.conversations if e.gruppo is Gruppo.IN_CORSO]
@@ -158,13 +163,25 @@ _URGENZA_DOT = {
 _PRESIDIO_SYMBOL = {Presidio.SCOPERTA: "❗", Presidio.PRESIDIATA: "✅"}
 _TEMPERATURA_SYMBOL = {Temperatura.ALTA: "🔥", Temperatura.MEDIA: "⚠️", Temperatura.BASSA: ""}
 
+# RUMORE is a group, not a severity: it needs no action, so the schema line and the
+# table row both carry this single neutral dot instead of the urgenza/presidio/
+# temperatura marks. Same glyph as the "bassa" urgency dot by coincidence — its own
+# constant because the two meanings are unrelated and must be free to drift apart.
+_RUMORE_DOT = "⚪"
+
 _SPECIES_MARKER = re.compile(r"\*\*(.+?)\*\*")  # only balanced pairs -> <i>...</i>
 
 
 def _table_symbols(entry: ConversationTriage) -> str:
     """Full symbol prefix for a table row: urgency dot + presidio + temperature.
 
-    The temperature symbol is ``""`` for ``bassa`` (calm is the norm — no mark)."""
+    RUMORE short-circuits to the neutral dot alone: the group requires no action, so
+    ❗/✅ and 🔥/⚠️ would be noise there — and the model fills those fields unreliably
+    for it (seen live: ❗ on a chat with zero client messages). Deterministic before
+    inference: we do not show a judgment where it means nothing, so the bug dies by
+    construction. The temperature symbol is ``""`` for ``bassa`` (calm is the norm)."""
+    if entry.gruppo is Gruppo.RUMORE:
+        return _RUMORE_DOT
     return (
         _URGENZA_DOT[entry.urgenza]
         + _PRESIDIO_SYMBOL[entry.presidio]
@@ -199,8 +216,9 @@ def _strip_species_marker(raw: str) -> str:
 
 
 def render_schema(result: TriageResult) -> str:
-    """Three-level prose. One paragraph per conversation in SUBITO/IN CORSO;
-    RUMORE collapses to a single cumulative line. Opens with the most urgent group.
+    """Three-level prose. One paragraph per conversation in SUBITO/IN CORSO; RUMORE
+    collapses to one line per distinct ``motivo``, with the names sharing it merged.
+    Opens with the most urgent group.
     """
     if not result.conversations:
         return _EMPTY_SCHEMA
@@ -237,14 +255,22 @@ def _schema_paragraph(entry: ConversationTriage) -> str:
 def _schema_rumore_section(entries: list[ConversationTriage]) -> str:
     if not entries:
         return f"{_H_RUMORE}\n{_EMPTY_GROUP}"
-    # Cumulative single line, but keep content: each one's short `motivo`, in parens
-    # so a motivo that itself contains commas stays unambiguous. Name in bold (it is a
-    # real field here), motivo through _html (escape + species italic).
-    items = ", ".join(
-        f"<b>{html.escape(e.nome, quote=False)}</b> ({_html(e.motivo.strip().rstrip('.'))})"
-        for e in entries
-    )
-    return f"{_H_RUMORE}\n{items}."
+    # One line per distinct motivo, names merged: the output schema forces one entry per
+    # conversation, so only the renderer can collapse the repetition (seen live: three
+    # separate "(Conversazione chiusa)"). The key drops the final period the model adds
+    # erratically and IS the text we print, so one motivo = one wording. Dict order =
+    # first appearance, for the groups and for the names inside one. Names in bold (a
+    # real field here), motivo through _html (escape + species italic), and _as_sentence
+    # for exactly one closing mark — it also lands the period outside a trailing </i>.
+    grouped: dict[str, list[str]] = {}  # motivo -> already-escaped bold names
+    for entry in entries:
+        key = entry.motivo.strip().rstrip(".")
+        grouped.setdefault(key, []).append(f"<b>{html.escape(entry.nome, quote=False)}</b>")
+    lines = [_H_RUMORE]
+    for motivo, names in grouped.items():
+        tail = f": {_html(motivo)}" if motivo else ""  # nothing left to say -> names alone
+        lines.append(_as_sentence(f"{_RUMORE_DOT} {', '.join(names)}{tail}"))
+    return "\n".join(lines)
 
 
 # --- TABELLA: one compact plain-text line per conversation ---------------------
