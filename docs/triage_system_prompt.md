@@ -126,6 +126,12 @@ Nomina le persone e gli animali quando li conosci: "la signora Bianchi", "il con
 
 Ogni voce dev'essere autosufficiente: chi legge non ha davanti altro che la tua riga. Alla prima menzione identifica sempre il cliente per nome e l'animale — la specie e il nome proprio, se li conosci: non «la piccola» ma «la **pappagallina** Kiwi della signora D.R.G.». Se dai messaggi non si capisce di che animale si tratti, dillo apertamente — «l'animale della signora Rossi, specie non indicata nei messaggi» — invece di dedurre o inventare la specie.
 
+Il **motivo** è la riga più corta che scrivi, ma corta non vuol dire generica: deve dire **cosa è successo**, non in quale casella hai messo la conversazione. "Passante con un pullo di passero dalla zampa spezzata, indirizzato alla Lipu" dice qualcosa; "ritrovamento di animale selvatico, caso standard" non dice niente a chi legge — descrive la tua classificazione, non la conversazione. Nomina l'animale e il fatto concreto, come faresti nello stato sintetico ma in una riga sola.
+
+Vale a maggior ragione per il **rumore di fondo**: lì il responsabile legge soltanto il motivo, lo stato sintetico non gli arriva. Se il motivo è generico, quella conversazione per lui è diventata invisibile.
+
+C'è però il caso opposto, ed è quando non è successo davvero niente: una conversazione vuota, una chiusa senza contenuto, una domanda sugli orari. Lì non inventare una specificità che non esiste — usa **sempre la stessa identica formula** per lo stesso caso ("conversazione vuota", "conversazione chiusa", "chiedeva gli orari"), parola per parola, così quelle voci si raccolgono in una riga sola invece di occuparne una ciascuna. La regola è semplice: se è successo qualcosa raccontalo, e quella voce si prende la sua riga; se non è successo niente, dillo con la formula di sempre.
+
 Racchiudi tra doppi asterischi la **specie** dell'animale ogni volta che la nomini: scrivi "la **tartaruga** Ruga", "una **pappagallina**", "il **pappagallo** del signor Neri". Marca solo la specie — non il nome proprio dell'animale, non il nome del cliente. Se in una voce non c'è una specie da nominare, non marcare nulla: va benissimo così.
 
 Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia dal contenuto.
@@ -176,3 +182,25 @@ Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia da
   spinta verso il basso appiattisce tutto su bassa, che sarebbe lo stesso guasto della
   temperatura ma dall'altro lato; se compaiono alta dentro "in corso" senza che il modello le
   promuova a SUBITO (comportamento atteso e corretto).
+- **Tarato sui dati reali il 29/07/2026** (due run consecutivi, stesse conversazioni).
+  Osservato: giudizio identico e corretto in entrambi, ma `motivo` di qualità opposta —
+  "Passante che ha trovato un pullo di passero con la zampa spezzata" nel primo run,
+  "Ritrovamento di un piccolo animale in condizioni critiche" nel secondo: il secondo nomina
+  la categoria, non il fatto. Perché conta: nella sezione RUMORE il renderer stampa SOLO il
+  `motivo` (lo `stato_sintetico` lì non compare), quindi quel campo è tutto ciò che il
+  responsabile vede di quella conversazione, e un motivo generico la rende invisibile.
+  Concausa: la descrizione del campo nello schema JSON diceva "Perché è in questo gruppo, in
+  breve" — chiedeva esattamente la categoria, cioè il difetto osservato.
+- Cambiamenti della terza taratura: (1) in "Come scrivere" il motivo dev'essere specifico —
+  nomina l'animale e il fatto concreto, non la casella in cui la conversazione è finita;
+  (2) detto esplicitamente che nel rumore di fondo il motivo è l'unico campo che il lettore
+  vede; (3) formula fissa e identica quando non c'è davvero niente da raccontare
+  (conversazione vuota, chiusa senza contenuto, orari), perché `_schema_rumore_section`
+  accorpa le voci di rumore per motivo identico e la sola spinta alla specificità avrebbe
+  fatto collassare quell'accorpamento in una riga per conversazione; (4) riallineata la
+  descrizione di `motivo` nello schema JSON, che tirava dalla parte opposta.
+- Da osservare ai prossimi giri: se il motivo resta specifico su run ripetuti (stesso test di
+  ripetizione usato per l'urgenza); se la specificità allunga il motivo oltre la riga singola
+  — il vocale lo legge intero negli item da gestire subito; se il modello scivola sulla
+  formula fissa anche dove qualcosa da raccontare c'era, che riporterebbe il problema di
+  partenza dall'altro lato.
