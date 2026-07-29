@@ -114,6 +114,16 @@ def _count_word(n: int) -> str:
     return _COUNT_WORDS.get(n, str(n))
 
 
+def _agree(n: int, singular: str, plural: str) -> str:
+    """Pick the Italian wording that agrees with ``n``.
+
+    The voice text is fed to TTS, where a number mismatch ("Ci sono una
+    conversazione") is far more audible than it is readable, so every part of the
+    panoramica that inflects goes through here instead of an inline conditional.
+    """
+    return singular if n == 1 else plural
+
+
 def _one_line(text: str, limit: int = _TABLE_STATE_LIMIT) -> str:
     """Collapse whitespace/newlines to single spaces and truncate on a word
     boundary with an ellipsis. Used by the compact table only."""
@@ -365,29 +375,41 @@ def _panoramica(
     *,
     after_urgent: bool,
 ) -> str:
-    """One sentence aggregating the non-urgent rest: counts + presidio check."""
+    """One sentence aggregating the non-urgent rest: counts + presidio check.
+
+    Every inflecting piece goes through :func:`_agree`, the opening verb included:
+    with subjects coordinated by "più", Italian agrees with the FIRST one, so the
+    verb follows ``counts[0]`` and not the total ("C'è una conversazione in corso,
+    presidiata, più due voci di rumore di fondo").
+    """
     segments: list[str] = []
+    counts: list[int] = []
     if in_corso:
+        counts.append(len(in_corso))
         segments.append(_panoramica_in_corso(in_corso))
     if rumore:
         r = len(rumore)
-        segments.append(f"{_count_word(r)} {'voce' if r == 1 else 'voci'} di rumore di fondo")
+        counts.append(r)
+        segments.append(f"{_count_word(r)} {_agree(r, 'voce', 'voci')} di rumore di fondo")
     if not segments:
         return "Non c'è altro da segnalare." if after_urgent else ""
     body = ", più ".join(segments)
-    return f"Per il resto, {body}." if after_urgent else f"Ci sono {body}."
+    if after_urgent:  # "Per il resto, ..." — nessun verbo, niente da accordare
+        return f"Per il resto, {body}."
+    verb = _agree(counts[0], "C'è", "Ci sono")  # accorda col primo soggetto, non col totale
+    return f"{verb} {body}."
 
 
 def _panoramica_in_corso(in_corso: list[ConversationTriage]) -> str:
     n = len(in_corso)
-    noun = "conversazione in corso" if n == 1 else "conversazioni in corso"
+    noun = _agree(n, "conversazione in corso", "conversazioni in corso")
     scoperte = sum(1 for e in in_corso if e.presidio is Presidio.SCOPERTA)
     if scoperte == 0:
-        presidio = "presidiata" if n == 1 else "tutte presidiate"
+        presidio = _agree(n, "presidiata", "tutte presidiate")
     elif scoperte == n:
-        presidio = "ancora scoperta" if n == 1 else "tutte ancora scoperte"
+        presidio = _agree(n, "ancora scoperta", "tutte ancora scoperte")
     else:
-        presidio = f"{_count_word(scoperte)} ancora {'scoperta' if scoperte == 1 else 'scoperte'}"
+        presidio = f"{_count_word(scoperte)} ancora {_agree(scoperte, 'scoperta', 'scoperte')}"
     return f"{_count_word(n)} {noun}, {presidio}"
 
 

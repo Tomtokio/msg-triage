@@ -467,6 +467,86 @@ def test_voice_stays_plain_strips_marker_no_tags_no_symbols():
     assert "tartaruga" in voice  # the species word survives, just unmarked
 
 
+# --- VOCALE: accordo di numero nella panoramica --------------------------------
+# Il vocale finisce in sintesi vocale (T6): una concordanza sbagliata si SENTE.
+# Seen live: "Ci sono una conversazione in corso, presidiata, più una voce di
+# rumore di fondo" — il verbo era plurale fisso.
+
+
+def test_voice_panoramica_singular_agreement():
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO),
+        _entry(gruppo=Gruppo.RUMORE, contact_id="c2"),
+    )
+    voice = render_voice(r)
+    assert "C'è una conversazione in corso, presidiata, più una voce di rumore di fondo." in voice
+    assert "Ci sono una" not in voice
+    assert "più una voci" not in voice
+
+
+def test_voice_panoramica_singular_uncovered():
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.SCOPERTA))
+    assert "C'è una conversazione in corso, ancora scoperta." in render_voice(r)
+
+
+def test_voice_panoramica_rumore_only_agrees_with_its_own_count():
+    one = _result(_entry(gruppo=Gruppo.RUMORE))
+    assert "C'è una voce di rumore di fondo." in render_voice(one)
+    three = _result(*(_entry(gruppo=Gruppo.RUMORE, contact_id=f"c{i}") for i in range(3)))
+    assert "Ci sono tre voci di rumore di fondo." in render_voice(three)
+
+
+def test_voice_panoramica_plural_verb_with_singular_tail():
+    # Con soggetti coordinati da "più" il verbo accorda col PRIMO, non col totale.
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO),
+        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2"),
+        _entry(gruppo=Gruppo.RUMORE, contact_id="c3"),
+    )
+    voice = render_voice(r)
+    assert (
+        "Ci sono due conversazioni in corso, tutte presidiate, più una voce di rumore di fondo."
+        in voice
+    )
+
+
+def test_voice_panoramica_after_urgent_has_no_verb():
+    r = _result(
+        _entry(gruppo=Gruppo.SUBITO, motivo="bloccato in farmacia", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2"),
+    )
+    voice = render_voice(r)
+    assert "Per il resto, una conversazione in corso, presidiata." in voice
+    assert "Ci sono" not in voice and "C'è" not in voice
+
+
+def test_voice_panoramica_never_mismatches_number():
+    mismatches = (
+        "Ci sono una ",
+        "C'è due ",
+        "C'è tre ",
+        "una conversazioni",
+        "una voci",
+        "due conversazione in corso",
+        "tre conversazione in corso",
+        "tutte presidiata",
+        "tutte ancora scoperta",
+        "una ancora scoperte",
+        "due voce di rumore",
+    )
+    for scoperte in (False, True):
+        presidio = Presidio.SCOPERTA if scoperte else Presidio.PRESIDIATA
+        for n_corso in range(4):
+            for n_rumore in range(4):
+                entries = [
+                    _entry(gruppo=Gruppo.IN_CORSO, contact_id=f"i{i}", presidio=presidio)
+                    for i in range(n_corso)
+                ] + [_entry(gruppo=Gruppo.RUMORE, contact_id=f"r{i}") for i in range(n_rumore)]
+                voice = render_voice(_result(*entries))
+                for bad in mismatches:
+                    assert bad not in voice, f"{n_corso}+{n_rumore} scoperte={scoperte}: {voice!r}"
+
+
 # --- Helpers, container, determinism -------------------------------------------
 
 
