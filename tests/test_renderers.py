@@ -434,14 +434,15 @@ def test_voice_opens_with_urgency_and_narrates_in_corso():
     voice = render_voice(r)
     # SUBITO opens, spoken from motivo with the name, then the capitalized azione.
     assert voice.startswith(
-        "Una cosa da gestire subito: Sig. Verdi, bloccato in farmacia, ricetta sbagliata."
+        "Una cosa da gestire subito: Sig. Verdi bloccato in farmacia, ricetta sbagliata."
     )
     assert "Chiamare la farmacia." in voice
     assert "DETTAGLIO_STATO_NON_VOCALE" not in voice  # stato_sintetico is NEVER spoken
     assert "DETTAGLIO_INCORSO" not in voice
-    # IN CORSO are now narrated by name, from motivo (not just counted).
-    assert "Bianchi, aspetta conferma per la dimissione." in voice
-    assert "Amir, chiede della terapia." in voice
+    # IN CORSO are now narrated by name, from motivo (not just counted); after the urgent
+    # block the first one carries the "Per il resto, " connective.
+    assert "Per il resto, Bianchi aspetta conferma per la dimissione." in voice
+    assert "Amir chiede della terapia." in voice
     assert "•" not in voice and "\n- " not in voice  # no bullet lists
     assert "\n" not in voice  # one continuous paragraph
 
@@ -453,10 +454,10 @@ def test_voice_no_urgency_narrates_in_corso_by_name():
     )
     voice = render_voice(r)
     assert voice.startswith("Niente di urgente.")
-    assert "Bianchi, aspetta conferma." in voice
-    assert "Amir, chiede della terapia." in voice
-    assert "aspettano ancora risposta" not in voice  # all presidiate -> no waiting closing
-    assert "Nessuno ha ancora risposto" not in voice
+    assert "Bianchi aspetta conferma." in voice
+    assert "Amir chiede della terapia." in voice
+    assert "Per il resto" not in voice  # no SUBITO: the opener already marks the register
+    assert "aspetta ancora risposta" not in voice  # all presidiate -> no waiting closing
 
 
 def test_voice_narrates_in_corso_with_name_and_azione():
@@ -468,40 +469,76 @@ def test_voice_narrates_in_corso_with_name_and_azione():
             azione_suggerita="confermare per stasera",
         )
     )
-    assert "Bianchi, aspetta conferma. Confermare per stasera." in render_voice(r)
+    assert "Bianchi aspetta conferma. Confermare per stasera." in render_voice(r)
+
+
+def test_voice_transitions_to_in_corso_after_urgent():
+    # Speech has no blank line between blocks: without a connective the listener slides
+    # from the last urgent item into the routine ones with no warning.
+    r = _result(
+        _entry(
+            gruppo=Gruppo.SUBITO,
+            nome="Verdi",
+            urgenza=Urgenza.ALTA,
+            presidio=Presidio.SCOPERTA,
+            motivo="bloccato in farmacia",
+        ),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", contact_id="c2", motivo="aspetta conferma"),
+    )
+    assert "Per il resto, Bianchi aspetta conferma." in render_voice(r)
+    # Only once, on the first narrated item — not on every in-corso sentence.
+    assert render_voice(r).count("Per il resto") == 1
 
 
 # --- VOCALE: chiusura di presidio (il segnale "scoperta" non si perde) ---------
 # Anche senza tetto (giorni normali, <=6 IN CORSO) il vocale deve dire chi aspetta.
 
 
-def test_voice_waiting_closing_one_uncovered_is_pronoun_free():
-    # Una sola IN CORSO scoperta: niente "Una aspetta…" (pronome senza antecedente), la
-    # forma senza pronome. È il caso più frequente sui run reali.
-    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA))
-    voice = render_voice(r)
-    assert "Nessuno ha ancora risposto." in voice
-    assert "Una aspetta" not in voice
+def test_voice_waiting_closing_omitted_when_few_in_corso():
+    # Con una o due voci raccontate la chiusura ripeterebbe, una frase dopo, quello che
+    # chi ascolta ha appena sentito ("Rossi aspetta la ricetta / Rossi aspetta ancora
+    # risposta"). Serve quando le voci sono tante e non ricordi quale fosse scoperta.
+    one = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA)
+    )
+    assert "aspetta ancora risposta" not in render_voice(one)
 
-
-def test_voice_waiting_closing_plural_uses_di_queste():
-    both = _result(
+    two = _result(
         _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
         _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="chiede un controllo", presidio=Presidio.SCOPERTA),
     )
-    assert "Di queste, due aspettano ancora risposta." in render_voice(both)
-    # One uncovered out of two: singular verb, still anchored by "queste".
-    one = _result(
+    voice = render_voice(two)
+    assert "aspetta ancora risposta" not in voice and "Di queste" not in voice
+
+
+def test_voice_waiting_closing_names_the_single_uncovered():
+    # Da tre voci in su la chiusura serve. Una sola scoperta: si dice il NOME — è quello su
+    # cui chi ascolta può agire, e "una" sarebbe un pronome senza antecedente.
+    r = _result(
         _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
-        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="tutto ok", presidio=Presidio.PRESIDIATA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="tutto ok"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Blu", contact_id="c3", motivo="chiedeva gli orari"),
     )
-    assert "Di queste, una aspetta ancora risposta." in render_voice(one)
+    voice = render_voice(r)
+    assert "Rossi aspetta ancora risposta." in voice
+    assert "Una aspetta" not in voice and "Di queste" not in voice
+
+
+def test_voice_waiting_closing_falls_back_to_count_from_two_uncovered():
+    # Due o più scoperte: i nomi diventerebbero una lista troppo lunga per l'ascolto.
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="chiede un controllo", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Blu", contact_id="c3", motivo="tutto ok"),
+    )
+    assert "Di queste, due aspettano ancora risposta." in render_voice(r)
 
 
 def test_voice_waiting_closing_absent_when_all_presidiate():
     r = _result(
         _entry(gruppo=Gruppo.IN_CORSO, nome="A", motivo="m1"),
         _entry(gruppo=Gruppo.IN_CORSO, nome="B", contact_id="c2", motivo="m2"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="C", contact_id="c3", motivo="m3"),
     )
     voice = render_voice(r)
     assert "aspetta" not in voice and "risposto" not in voice
@@ -517,9 +554,10 @@ def test_voice_caps_in_corso_and_compresses_overflow():
         for i in range(n)
     ]
     voice = render_voice(_result(*entries))
-    assert "Cliente0, motivo 0." in voice  # first narrated by name
-    assert f"Cliente{_VOICE_IN_CORSO_CAP - 1}," in voice  # last under the cap narrated
-    assert f"Cliente{_VOICE_IN_CORSO_CAP}," not in voice  # beyond the cap: not narrated
+    last = _VOICE_IN_CORSO_CAP - 1
+    assert "Cliente0 motivo 0." in voice  # first narrated by name
+    assert f"Cliente{last} motivo {last}." in voice  # last under the cap narrated
+    assert f"Cliente{_VOICE_IN_CORSO_CAP}" not in voice  # beyond the cap: not narrated
     assert "E altre quattro conversazioni in corso, tutte presidiate." in voice
 
 
@@ -597,7 +635,7 @@ def test_voice_number_agreement_never_mismatches():
         "due conversazione in corso", "tre conversazione in corso",
         "tutte presidiata", "tutte ancora scoperta", "una ancora scoperte",
         "due voce di rumore", "tre voce di rumore",
-        "Una aspetta", "una aspettano",
+        "Una aspetta", "una aspettano", "Di queste, una ",  # one uncovered -> the NAME
         "due aspetta ", "tre aspetta ", "quattro aspetta ", "cinque aspetta ",
         "E altre una ", "un'altra due", "un'altra conversazioni",
     )

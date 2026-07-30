@@ -332,6 +332,7 @@ def _table_row(entry: ConversationTriage) -> str:
 # --- VOCALE: schema raccontato, TTS-oriented -----------------------------------
 
 _VOICE_IN_CORSO_CAP = 6  # narrate this many IN CORSO in full; compress the rest to a count
+_VOICE_WAITING_MIN = 3  # emit the presidio closing only from this many narrated IN CORSO up
 
 
 def render_voice(result: TriageResult) -> str:
@@ -344,7 +345,11 @@ def render_voice(result: TriageResult) -> str:
         return _EMPTY_VOICE
     subito, in_corso, rumore = _bucket(result)
     opener = _voice_urgent(subito) if subito else "Niente di urgente."
-    parts = [opener, _voice_in_corso(in_corso), _voice_rumore(rumore)]
+    parts = [
+        opener,
+        _voice_in_corso(in_corso, after_urgent=bool(subito)),
+        _voice_rumore(rumore),
+    ]
     return " ".join(p for p in parts if p)  # one continuous paragraph for TTS
 
 
@@ -358,17 +363,16 @@ def _voice_urgent(subito: list[ConversationTriage]) -> str:
 
 def _voice_item(entry: ConversationTriage) -> str:
     # Voce = sintetico: si legge `motivo` (frase secca di una riga, per costruzione),
-    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Il nome va anteposto —
-    # chi ascolta non ha contesto davanti e `motivo` non porta il nome del cliente — con
-    # un lead-in a virgola, robusto a ogni forma di motivo (verbo/nome/participio).
-    # WATCH-LIST (prima cosa da riascoltare sui run reali): "{nome}, {motivo}." separa
-    # soggetto e verbo con una virgola — scorretto in italiano scritto, accettabile
-    # all'ascolto come stile telegrafico. Se suona male: invertire ("Da parte di {nome},
-    # …") o togliere la virgola quando il motivo apre con un verbo. Il marcatore
-    # `**specie**` va tolto: il vocale è testo pulito (niente tag, niente **).
+    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Il nome va anteposto: chi
+    # ascolta non ha contesto davanti e `motivo` non porta il nome del cliente. Senza
+    # virgola — "{nome} {motivo}" scorre con tutte le forme reali di motivo, verbo
+    # ("Tramontana chiede se può passare") e participio ("Verdi bloccato in farmacia");
+    # verificato all'ascolto che la virgola separava soggetto e verbo e si sentiva
+    # ("Tramontana, chiede"). Il marcatore `**specie**` va tolto: il vocale è testo pulito
+    # (niente tag, niente **).
     motivo = _strip_species_marker(" ".join(entry.motivo.split())).strip()
     name = entry.nome.strip()
-    spoken = _as_sentence(f"{name}, {motivo}" if name and motivo else (name or motivo))
+    spoken = _as_sentence(f"{name} {motivo}" if name and motivo else (name or motivo))
     action = _strip_species_marker(entry.azione_suggerita.strip())
     if action:
         action = _as_sentence(action[:1].upper() + action[1:])
@@ -376,10 +380,16 @@ def _voice_item(entry: ConversationTriage) -> str:
     return spoken
 
 
-def _voice_in_corso(in_corso: list[ConversationTriage]) -> str:
+def _voice_in_corso(in_corso: list[ConversationTriage], *, after_urgent: bool) -> str:
     """Narrate the IN CORSO one sentence each (capped at ``_VOICE_IN_CORSO_CAP``), then a
     presidio closing over the narrated ones, then — if capped — a count tail for the rest.
     Entries arrive urgency-sorted from :func:`_bucket`, so the cap keeps the most urgent.
+
+    After the urgent block the first sentence opens with "Per il resto, ": speech has no
+    blank line to mark the change of register, so without the connective the listener
+    slides from the last urgent item straight into the routine ones with no warning. With
+    no SUBITO the "Niente di urgente." opener already does that job and the block starts
+    directly.
     """
     if not in_corso:
         return ""
@@ -387,27 +397,40 @@ def _voice_in_corso(in_corso: list[ConversationTriage]) -> str:
     capped = cap is not None and len(in_corso) > cap
     narrated = in_corso[:cap] if capped else in_corso
     parts = [_voice_item(entry) for entry in narrated]
+    if after_urgent and parts[0]:
+        parts[0] = f"Per il resto, {parts[0]}"
     waiting = _voice_in_corso_waiting(narrated)
     if waiting:
         parts.append(waiting)
     if capped:
         parts.append(_voice_in_corso_tail(in_corso[cap:]))
-    return " ".join(parts)
+    return " ".join(p for p in parts if p)
 
 
 def _voice_in_corso_waiting(narrated: list[ConversationTriage]) -> str:
-    """Presidio closing over the narrated IN CORSO: how many still await a reply. Keeps
-    the "scoperta" signal alive even with no cap (the common ≤6 day). With ONE narrated
-    (thus uncovered) → the pronoun-free "Nessuno ha ancora risposto." (an "Una…" would
-    have no antecedent, and one IN CORSO is the frequent real case); with ≥2 → "Di queste,
-    {n} aspettano ancora risposta." where "queste" anchors the count. "" if all presidiate.
+    """Presidio closing over the narrated IN CORSO: WHO still awaits a reply. Keeps the
+    "scoperta" signal alive even when the cap never fires (the common ≤6 day).
+
+    Only from ``_VOICE_WAITING_MIN`` narrated up: with one or two voices the closing would
+    repeat, a sentence later, what the listener has just heard ("Tramontana chiede… /
+    Tramontana aspetta ancora risposta"). It earns its place when the voices are many and
+    you no longer remember which one was uncovered.
+
+    One uncovered → say the NAME ("Tramontana aspetta ancora risposta."): the name is the
+    part the listener can act on, where a bare "una" would be a pronoun without an
+    antecedent. From two up, the names would become a list too long to listen to, so it
+    falls back to the count anchored by "queste". Returns "" when all are presidiate.
     """
-    scoperte = sum(1 for e in narrated if e.presidio is Presidio.SCOPERTA)
-    if scoperte == 0:
+    if len(narrated) < _VOICE_WAITING_MIN:
         return ""
-    if len(narrated) == 1:
-        return "Nessuno ha ancora risposto."
-    return f"Di queste, {_count_word(scoperte)} {_agree(scoperte, 'aspetta', 'aspettano')} ancora risposta."
+    uncovered = [e for e in narrated if e.presidio is Presidio.SCOPERTA]
+    if not uncovered:
+        return ""
+    if len(uncovered) == 1:
+        name = uncovered[0].nome.strip()
+        tail = f"{name} aspetta ancora risposta" if name else "Una conversazione aspetta ancora risposta"
+        return _as_sentence(tail)
+    return f"Di queste, {_count_word(len(uncovered))} aspettano ancora risposta."
 
 
 def _voice_in_corso_tail(overflow: list[ConversationTriage]) -> str:
