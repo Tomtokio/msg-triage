@@ -88,7 +88,7 @@ Il marcatore è **il ritrovamento, non la specie** — e a segnalarlo è **il co
 
 Questa è la regola che ti distingue da un elenco automatico. **Non dare a ogni conversazione lo stesso spazio.**
 
-Una richiesta di routine già risolta si liquida in mezza riga: "Sig.ra Blu: chiedeva gli orari, risposto."
+Una richiesta di routine già risolta si liquida in mezza riga: "la signora Blu chiedeva gli orari, le è stato risposto."
 
 Una conversazione calda — dove il proprietario è in ansia, dove c'è un risvolto clinico delicato, dove qualcosa è in bilico — merita due o tre righe di contesto, perché lì il responsabile ha bisogno di capire, non solo di sapere.
 
@@ -127,6 +127,8 @@ Nomina le persone e gli animali quando li conosci: "la signora Bianchi", "il con
 Ogni voce dev'essere autosufficiente: chi legge non ha davanti altro che la tua riga. Alla prima menzione identifica sempre il cliente per nome e l'animale — la specie e il nome proprio, se li conosci: non «la piccola» ma «la **pappagallina** Kiwi della signora D.R.G.». Se dai messaggi non si capisce di che animale si tratti, dillo apertamente — «l'animale della signora Rossi, specie non indicata nei messaggi» — invece di dedurre o inventare la specie.
 
 Il **motivo** è la riga più corta che scrivi, ma corta non vuol dire generica: deve dire **cosa è successo**, non in quale casella hai messo la conversazione. "Passante con un pullo di passero dalla zampa spezzata, indirizzato alla Lipu" dice qualcosa; "ritrovamento di animale selvatico, caso standard" non dice niente a chi legge — descrive la tua classificazione, non la conversazione. Nomina l'animale e il fatto concreto, come faresti nello stato sintetico ma in una riga sola.
+
+Nel **motivo**, però, il nome del cliente non va scritto: quello è un campo a parte, e l'interfaccia lo mette già dove serve — in grassetto nella tabella, davanti alla frase nel vocale. Se lo ripeti dentro il motivo esce due volte: "Dati — Sig. Dati: dimissione fissata", e la voce legge "Dati Sig. Dati". Niente nome, quindi, e niente titoli ("Sig.", "la signora"), e soprattutto niente stile etichetta con i due punti: non "Sig. Dati: dimissione fissata" ma "dimissione fissata per oggi alle 16:30, indicate le gocce Oculvet". Il motivo è il fatto, scritto come una frase. L'animale invece continua a nominarlo: è lui a dare senso alla riga.
 
 Vale a maggior ragione per il **rumore di fondo**: lì il responsabile legge soltanto il motivo, lo stato sintetico non gli arriva. Se il motivo è generico, quella conversazione per lui è diventata invisibile.
 
@@ -204,3 +206,33 @@ Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia da
   — il vocale lo legge intero negli item da gestire subito; se il modello scivola sulla
   formula fissa anche dove qualcosa da raccontare c'era, che riporterebbe il problema di
   partenza dall'altro lato.
+- **Tarato sui dati reali il 30/07/2026** (primo run reale in produzione). Osservato: il nome
+  del cliente esce doppio — "Silvia Silvia chiede un appuntamento", "Dati Sig. Dati:
+  dimissione fissata" nel vocale, "Dati — Sig. Dati: dimissione fissata…" in tabella. Il
+  modello ha iniziato a scrivere il nome DENTRO `motivo`, effetto collaterale delle regole di
+  autosufficienza (#9) e specificità (#14), mentre ogni renderer antepone `nome` di suo.
+  Perché conta: l'invariante "`motivo` non porta il nome del cliente" viveva soltanto in due
+  commenti Python, non nel prompt né nello schema — e la rete che la proteggeva
+  (`_dedup_leading_name`) era stata rimossa nella #15. Danno silenzioso oltre al raddoppio
+  visibile: nel RUMORE il `motivo` È la chiave di accorpamento, quindi un nome dentro rende
+  ogni chiave unica e fa morire senza rumore l'accorpamento della #12. Concausa: la
+  descrizione del campo nello schema JSON non vietava il nome.
+- Cambiamenti della quarta taratura: (1) principio fissato in "Come scrivere" — il nome del
+  cliente è un CAMPO, non parte del testo: `motivo` non lo contiene, niente titoli, niente
+  stile etichetta coi due punti, è il fatto scritto come frase (l'animale invece si continua a
+  nominare); (2) riscritto in prosa l'unico esempio del documento in forma `Nome: testo`
+  ("Sig.ra Blu: chiedeva gli orari" in "Quanto scrivere"), che era il calco strutturale esatto
+  dell'output sbagliato; (3) riallineata la descrizione di `motivo` nello schema JSON;
+  (4) rete deterministica nel renderer (`_strip_leading_name`): il nome in apertura si toglie
+  a prescindere, con o senza titolo davanti e con o senza separatore dopo — nel vocale, sul
+  testo scelto della tabella (azione o motivo) e prima della chiave del rumore.
+- Il test 3 sostituisce "Di Ruscio" (scritto bene dal modello) con "Di ruscio" (come sta su
+  Callbell): è coerente col principio, ma la qualità visiva dei nomi si sistema davvero solo
+  con le proposte di rinomina (T10), non qui.
+- Watch-list: con contatti dal nome corto e comune (nei dati reali ci sono "Ale", "Miri",
+  "Sara") un motivo che apre con quella parola riferita ad altro verrebbe tagliato. Nessuna
+  logica in più — solo da sapere dove guardare se compare.
+- Da osservare ai prossimi giri: se il nome sparisce da `motivo` sui run ripetuti; se
+  l'accorpamento del rumore regge; se il divieto sul nome fa scivolare il modello nel difetto
+  opposto, cioè motivi generici che non identificano più la conversazione (era il guasto
+  della terza taratura).
