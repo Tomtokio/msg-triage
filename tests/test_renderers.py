@@ -115,7 +115,7 @@ def test_schema_sections_in_fixed_order():
 # --- SCHEMA --------------------------------------------------------------------
 
 
-def test_schema_keeps_stato_verbatim_table_collapses_and_truncates():
+def test_schema_keeps_stato_verbatim():
     long_stato = (
         "Riga uno molto lunga.\nRiga due.\n"
         "Riga tre con parecchie parole in più per superare il limite di ottanta caratteri."
@@ -123,6 +123,12 @@ def test_schema_keeps_stato_verbatim_table_collapses_and_truncates():
     r = _result(_entry(gruppo=Gruppo.IN_CORSO, stato_sintetico=long_stato))
     assert long_stato.strip() in render_schema(r)  # verbatim, newlines preserved
 
+
+def test_table_truncates_long_text_as_safety_net():
+    # The table renders azione/motivo (one-liners by design); truncation is only a net
+    # against a model that ignores "una riga". A long azione collapses to one line + "…".
+    long_azione = "chiamare la farmacia " * 20  # well over _TABLE_ROW_LIMIT
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, azione_suggerita=long_azione))
     row = next(l for l in render_table(r).splitlines() if "Sig.ra Rossi" in l)
     assert "\n" not in row
     assert row.endswith("…")
@@ -294,33 +300,31 @@ def test_table_rumore_row_carries_only_the_neutral_dot():
         assert symbol not in row
 
 
-def test_table_strips_leading_client_name_from_prose():
-    r = _result(
-        _entry(
-            gruppo=Gruppo.IN_CORSO,
-            nome="Sig.ra Rossi",
-            stato_sintetico="Sig.ra Rossi chiede quando è pronta la ricetta.",
-        )
+def test_table_row_prefers_azione_then_motivo_then_bare():
+    # The row shows the action: azione_suggerita wins; motivo is the fallback; when both
+    # are empty the row is symbols + bold name alone (no " — ", no trailing text).
+    azione = _entry(
+        gruppo=Gruppo.IN_CORSO, nome="A", motivo="il coniglio non mangia", azione_suggerita="confermare per stasera"
     )
-    row = next(l for l in render_table(r).splitlines() if "<b>Sig.ra Rossi</b>" in l)
-    assert row.count("Sig.ra Rossi") == 1  # only in the bold prefix, not doubled in prose
-    assert "<b>Sig.ra Rossi</b> — Chiede quando" in row
-    # Schema is untouched: the name stays wherever the model wove it into the prose.
-    assert "Sig.ra Rossi chiede" in render_schema(r)
+    row_a = next(l for l in render_table(_result(azione)).splitlines() if "<b>A</b>" in l)
+    assert row_a.endswith("— confermare per stasera")
+    assert "coniglio" not in row_a  # motivo is not used when azione is present
 
+    only_motivo = _entry(gruppo=Gruppo.IN_CORSO, nome="B", motivo="passante con un pullo di passero", azione_suggerita="   ")
+    row_b = next(l for l in render_table(_result(only_motivo)).splitlines() if "<b>B</b>" in l)
+    assert row_b.endswith("— passante con un pullo di passero")  # whitespace azione falls back to motivo
 
-def test_table_keeps_prose_when_name_is_not_leading():
-    r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", stato_sintetico="La signora Bianchi aspetta conferma.")
-    )
-    row = next(l for l in render_table(r).splitlines() if "<b>Bianchi</b>" in l)
-    assert "La signora Bianchi aspetta" in row  # not stripped: the name is mid-sentence
+    bare = _entry(gruppo=Gruppo.IN_CORSO, nome="C", motivo="", azione_suggerita="")
+    row_c = next(l for l in render_table(_result(bare)).splitlines() if "<b>C</b>" in l)
+    assert row_c.endswith("<b>C</b>")  # bare: no " — ", no text
+    assert "—" not in row_c
 
 
 def test_table_strips_stray_marker_left_by_truncation():
-    # A multi-word species marker cut mid-pair by the 80-char truncation.
-    stato = ("parola " * 9) + "**parrocchetto australiano** che sta male"
-    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Z", stato_sintetico=stato))
+    # A multi-word species marker cut mid-pair by the _TABLE_ROW_LIMIT truncation: the
+    # balanced-only regex leaves the stray opening ``**``, which _table_row must strip.
+    motivo = ("parola " * 15) + "**parrocchetto australiano** che sta male"
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Z", motivo=motivo))
     row = next(l for l in render_table(r).splitlines() if "<b>Z</b>" in l)
     assert "**" not in row  # the stray opening marker is removed
     assert row.endswith("…")  # the row was truncated
@@ -337,6 +341,7 @@ def test_html_escaping_of_dynamic_text_in_schema_and_table():
             urgenza=Urgenza.ALTA,
             presidio=Presidio.SCOPERTA,
             stato_sintetico="dubbio su <dosaggio> & tempi",
+            azione_suggerita="verificare <dosaggio> & tempi",
         )
     )
     schema = render_schema(r)
@@ -346,15 +351,22 @@ def test_html_escaping_of_dynamic_text_in_schema_and_table():
     assert "<dosaggio>" not in schema
     # The name is a real field in the table row: escaped inside our <b> tag.
     assert "<b>Rossi &amp; &lt;Co&gt;</b>" in table
+    # The table now renders azione (escaped): raw brackets never reach the output.
     assert "&lt;dosaggio&gt;" in table
+    assert "<dosaggio>" not in table
 
 
 def test_species_marker_becomes_italic_in_schema_and_table():
     r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", stato_sintetico="la **tartaruga** Ruga non mangia")
+        _entry(
+            gruppo=Gruppo.IN_CORSO,
+            nome="Neri",
+            motivo="la **tartaruga** Ruga non mangia",
+            stato_sintetico="la **tartaruga** Ruga non mangia",
+        )
     )
     schema = render_schema(r)
-    table = render_table(r)
+    table = render_table(r)  # azione empty -> falls back to motivo, which carries the marker
     assert "<i>tartaruga</i>" in schema and "<i>tartaruga</i>" in table
     assert "**" not in schema and "**" not in table
 

@@ -7,8 +7,9 @@ and with no further inference. The narrative detail is already baked into
 renderers only lay it out — they never re-summarize prose.
 
 - ``render_schema`` = giornale di bordo completo, prosa a tre livelli.
-- ``render_table``  = una riga compatta per conversazione (testo semplice; niente
-                      tabelle monospace, fragili su Telegram mobile).
+- ``render_table``  = cruscotto operativo: una riga per conversazione con l'azione da
+                      fare (``azione_suggerita``, ripiego su ``motivo``); testo semplice,
+                      niente tabelle monospace fragili su Telegram mobile.
 - ``render_voice``  = sintetico, pensato per la sintesi vocale: apre dall'urgenza,
                       narra solo gli item "da gestire subito" (dal campo breve
                       ``motivo``, non dal paragrafo ``stato_sintetico``) e riassume
@@ -56,7 +57,7 @@ _EMPTY_SCHEMA = "Nessuna conversazione con attività recente."
 _EMPTY_TABLE = _EMPTY_SCHEMA
 _EMPTY_VOICE = "Tutto tranquillo: nessuna conversazione recente da segnalare."
 
-_TABLE_STATE_LIMIT = 80  # chars of stato_sintetico kept in a compact table row
+_TABLE_ROW_LIMIT = 120  # chars of azione/motivo kept in a row (safety net; one-liners by design)
 
 
 # --- Ordering (result.conversations is in model order, not grouped/sorted) -----
@@ -124,7 +125,7 @@ def _agree(n: int, singular: str, plural: str) -> str:
     return singular if n == 1 else plural
 
 
-def _one_line(text: str, limit: int = _TABLE_STATE_LIMIT) -> str:
+def _one_line(text: str, limit: int = _TABLE_ROW_LIMIT) -> str:
     """Collapse whitespace/newlines to single spaces and truncate on a word
     boundary with an ellipsis. Used by the compact table only."""
     collapsed = " ".join(text.split())
@@ -308,31 +309,23 @@ def _table_section(header: str, entries: list[ConversationTriage]) -> str:
     return "\n".join(lines)
 
 
-def _dedup_leading_name(stato: str, nome: str) -> str:
-    """Table only: if the prose opens with the client's own name, drop it (plus any
-    immediate separator) and re-capitalize. The bold ``<b>nome</b>`` prefix already
-    shows the name, so repeating it in the row is a doubling (seen in live testing).
-    Exact prefix match: if the model varies the wording ("la signora Rossi") nothing
-    is stripped, which is the safe default."""
-    prose = stato.lstrip()
-    if nome and prose.startswith(nome):
-        prose = prose[len(nome) :].lstrip(" .,:;—-")
-        if prose:
-            prose = prose[0].upper() + prose[1:]
-    return prose
-
-
 def _table_row(entry: ConversationTriage) -> str:
-    # Symbols replace the old "urgenza · presidio · temperatura" triplet. Drop a
-    # leading duplicate of the name (the bold prefix already shows it), then truncate
-    # on the RAW stato, THEN escape + italic. Truncation can cut inside a ``**...**``
-    # pair (e.g. a multi-word marker); the balanced-only regex would leave the stray
-    # ``**`` literal, so we strip any residual marker (seen live: "il suo **parrocchetto…").
+    # Dashboard, not narration: the row shows the ACTION to take. ``azione_suggerita`` is
+    # already a short operative line; fall back to ``motivo`` (the one-line fact) when the
+    # model left no action — typical of rumore and concluded chats — and to symbols + name
+    # alone when both are empty. Rendered verbatim (no re-capitalization): azione/motivo
+    # don't lead with the client name (the bold prefix already carries it), so the old
+    # stato-prose name-dedup is gone. Truncate on the RAW text (a safety net — these fields
+    # are one-liners by design), THEN escape + italic; truncation can cut inside a
+    # ``**...**`` pair, so strip any residual marker (seen live: "il suo **parrocchetto…").
     symbols = _table_symbols(entry)
-    prose = _dedup_leading_name(entry.stato_sintetico, entry.nome)
-    stato = _html(_one_line(prose)).replace("**", "")
+    name = f"<b>{html.escape(entry.nome, quote=False)}</b>"
+    text = entry.azione_suggerita.strip() or entry.motivo.strip()
     # SEAM T4: a terse memory tag (e.g. " [promessa scaduta]") would be appended here.
-    return f"{symbols} <b>{html.escape(entry.nome, quote=False)}</b> — {stato}"
+    if not text:
+        return f"{symbols} {name}"
+    body = _html(_one_line(text)).replace("**", "")
+    return f"{symbols} {name} — {body}"
 
 
 # --- VOCALE: synthetic, TTS-oriented -------------------------------------------
