@@ -10,12 +10,17 @@ from msg_triage.renderers import (
     _RUMORE_DOT,
     _TEMPERATURA_SYMBOL,
     _URGENZA_DOT,
+    _VOICE_IN_CORSO_CAP,
     RenderedTriage,
     _bucket,
     _memory_clause,
     _one_line,
     _schema_symbols,
     _table_symbols,
+    _voice_in_corso_tail,
+    _voice_in_corso_waiting,
+    _voice_rumore,
+    _voice_rumore_count,
     render_all,
     render_schema,
     render_table,
@@ -412,7 +417,7 @@ def test_schema_symbols_are_lighter_than_table():
 # --- VOCALE --------------------------------------------------------------------
 
 
-def test_voice_opens_with_urgency_and_summarizes_rest():
+def test_voice_opens_with_urgency_and_narrates_in_corso():
     r = _result(
         _entry(
             gruppo=Gruppo.SUBITO,
@@ -423,37 +428,147 @@ def test_voice_opens_with_urgency_and_summarizes_rest():
             stato_sintetico="DETTAGLIO_STATO_NON_VOCALE",
             azione_suggerita="chiamare la farmacia",
         ),
-        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", motivo="MOTIVO_INCORSO", stato_sintetico="DETTAGLIO_INCORSO"),
-        _entry(gruppo=Gruppo.IN_CORSO, nome="Amir", contact_id="c3"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", contact_id="c2", motivo="aspetta conferma per la dimissione", stato_sintetico="DETTAGLIO_INCORSO"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Amir", contact_id="c3", motivo="chiede della terapia"),
     )
     voice = render_voice(r)
-    assert voice.startswith("Una cosa da gestire subito:")
-    assert "bloccato in farmacia, ricetta sbagliata" in voice  # spoken from `motivo`
-    assert "Chiamare la farmacia." in voice  # azione, capitalized, single period
-    assert "DETTAGLIO_STATO_NON_VOCALE" not in voice  # stato_sintetico is NOT spoken
-    assert "MOTIVO_INCORSO" not in voice  # in-corso items are NOT narrated aloud
-    assert "due conversazioni in corso" in voice
-    assert "presidiate" in voice
+    # SUBITO opens, spoken from motivo with the name, then the capitalized azione.
+    assert voice.startswith(
+        "Una cosa da gestire subito: Sig. Verdi bloccato in farmacia, ricetta sbagliata."
+    )
+    assert "Chiamare la farmacia." in voice
+    assert "DETTAGLIO_STATO_NON_VOCALE" not in voice  # stato_sintetico is NEVER spoken
+    assert "DETTAGLIO_INCORSO" not in voice
+    # IN CORSO are now narrated by name, from motivo (not just counted); after the urgent
+    # block the first one carries the "Per il resto, " connective.
+    assert "Per il resto, Bianchi aspetta conferma per la dimissione." in voice
+    assert "Amir chiede della terapia." in voice
     assert "•" not in voice and "\n- " not in voice  # no bullet lists
+    assert "\n" not in voice  # one continuous paragraph
 
 
-def test_voice_no_urgency_reassures():
+def test_voice_no_urgency_narrates_in_corso_by_name():
     r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO),
-        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", motivo="aspetta conferma"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Amir", contact_id="c2", motivo="chiede della terapia"),
     )
     voice = render_voice(r)
     assert voice.startswith("Niente di urgente.")
-    assert "due conversazioni in corso" in voice
-    assert "tutte presidiate" in voice
+    assert "Bianchi aspetta conferma." in voice
+    assert "Amir chiede della terapia." in voice
+    assert "Per il resto" not in voice  # no SUBITO: the opener already marks the register
+    assert "aspetta ancora risposta" not in voice  # all presidiate -> no waiting closing
 
 
-def test_voice_flags_uncovered_in_panoramica():
+def test_voice_narrates_in_corso_with_name_and_azione():
     r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.SCOPERTA),
-        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2", presidio=Presidio.PRESIDIATA),
+        _entry(
+            gruppo=Gruppo.IN_CORSO,
+            nome="Bianchi",
+            motivo="aspetta conferma",
+            azione_suggerita="confermare per stasera",
+        )
     )
-    assert "una ancora scoperta" in render_voice(r)
+    assert "Bianchi aspetta conferma. Confermare per stasera." in render_voice(r)
+
+
+def test_voice_transitions_to_in_corso_after_urgent():
+    # Speech has no blank line between blocks: without a connective the listener slides
+    # from the last urgent item into the routine ones with no warning.
+    r = _result(
+        _entry(
+            gruppo=Gruppo.SUBITO,
+            nome="Verdi",
+            urgenza=Urgenza.ALTA,
+            presidio=Presidio.SCOPERTA,
+            motivo="bloccato in farmacia",
+        ),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Bianchi", contact_id="c2", motivo="aspetta conferma"),
+    )
+    assert "Per il resto, Bianchi aspetta conferma." in render_voice(r)
+    # Only once, on the first narrated item — not on every in-corso sentence.
+    assert render_voice(r).count("Per il resto") == 1
+
+
+# --- VOCALE: chiusura di presidio (il segnale "scoperta" non si perde) ---------
+# Anche senza tetto (giorni normali, <=6 IN CORSO) il vocale deve dire chi aspetta.
+
+
+def test_voice_waiting_closing_omitted_when_few_in_corso():
+    # Con una o due voci raccontate la chiusura ripeterebbe, una frase dopo, quello che
+    # chi ascolta ha appena sentito ("Rossi aspetta la ricetta / Rossi aspetta ancora
+    # risposta"). Serve quando le voci sono tante e non ricordi quale fosse scoperta.
+    one = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA)
+    )
+    assert "aspetta ancora risposta" not in render_voice(one)
+
+    two = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="chiede un controllo", presidio=Presidio.SCOPERTA),
+    )
+    voice = render_voice(two)
+    assert "aspetta ancora risposta" not in voice and "Di queste" not in voice
+
+
+def test_voice_waiting_closing_names_the_single_uncovered():
+    # Da tre voci in su la chiusura serve. Una sola scoperta: si dice il NOME — è quello su
+    # cui chi ascolta può agire, e "una" sarebbe un pronome senza antecedente.
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="tutto ok"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Blu", contact_id="c3", motivo="chiedeva gli orari"),
+    )
+    voice = render_voice(r)
+    assert "Rossi aspetta ancora risposta." in voice
+    assert "Una aspetta" not in voice and "Di queste" not in voice
+
+
+def test_voice_waiting_closing_falls_back_to_count_from_two_uncovered():
+    # Due o più scoperte: i nomi diventerebbero una lista troppo lunga per l'ascolto.
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Rossi", motivo="aspetta la ricetta", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", contact_id="c2", motivo="chiede un controllo", presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Blu", contact_id="c3", motivo="tutto ok"),
+    )
+    assert "Di queste, due aspettano ancora risposta." in render_voice(r)
+
+
+def test_voice_waiting_closing_absent_when_all_presidiate():
+    r = _result(
+        _entry(gruppo=Gruppo.IN_CORSO, nome="A", motivo="m1"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="B", contact_id="c2", motivo="m2"),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="C", contact_id="c3", motivo="m3"),
+    )
+    voice = render_voice(r)
+    assert "aspetta" not in voice and "risposto" not in voice
+
+
+# --- VOCALE: tetto morbido sulle IN CORSO --------------------------------------
+
+
+def test_voice_caps_in_corso_and_compresses_overflow():
+    n = _VOICE_IN_CORSO_CAP + 4
+    entries = [
+        _entry(gruppo=Gruppo.IN_CORSO, contact_id=f"i{i}", nome=f"Cliente{i}", motivo=f"motivo {i}")
+        for i in range(n)
+    ]
+    voice = render_voice(_result(*entries))
+    last = _VOICE_IN_CORSO_CAP - 1
+    assert "Cliente0 motivo 0." in voice  # first narrated by name
+    assert f"Cliente{last} motivo {last}." in voice  # last under the cap narrated
+    assert f"Cliente{_VOICE_IN_CORSO_CAP}" not in voice  # beyond the cap: not narrated
+    assert "E altre quattro conversazioni in corso, tutte presidiate." in voice
+
+
+def test_voice_cap_tail_singular_uncovered():
+    # cap+1 uncovered: SCOPERTA sorts first in _bucket, so the cap narrates the uncovered
+    # ones and the single overflow is uncovered too -> the tail's singular scoperta wording.
+    entries = [
+        _entry(gruppo=Gruppo.IN_CORSO, contact_id=f"i{i}", nome=f"C{i}", motivo=f"m{i}", presidio=Presidio.SCOPERTA)
+        for i in range(_VOICE_IN_CORSO_CAP + 1)
+    ]
+    assert "E un'altra conversazione in corso, ancora scoperta." in render_voice(_result(*entries))
 
 
 def test_voice_stays_plain_strips_marker_no_tags_no_symbols():
@@ -467,7 +582,7 @@ def test_voice_stays_plain_strips_marker_no_tags_no_symbols():
             motivo="la **tartaruga** è bloccata in farmacia",
             azione_suggerita="chiamare la farmacia",
         ),
-        _entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.SCOPERTA),
+        _entry(gruppo=Gruppo.IN_CORSO, nome="Neri", motivo="la **tartaruga** non mangia", presidio=Presidio.SCOPERTA),
     )
     voice = render_voice(r)
     assert "**" not in voice  # species marker stripped for the spoken text
@@ -479,84 +594,71 @@ def test_voice_stays_plain_strips_marker_no_tags_no_symbols():
     assert "tartaruga" in voice  # the species word survives, just unmarked
 
 
-# --- VOCALE: accordo di numero nella panoramica --------------------------------
-# Il vocale finisce in sintesi vocale (T6): una concordanza sbagliata si SENTE.
-# Seen live: "Ci sono una conversazione in corso, presidiata, più una voce di
-# rumore di fondo" — il verbo era plurale fisso.
+# --- VOCALE: rumore in coda, a contenuto ---------------------------------------
 
 
-def test_voice_panoramica_singular_agreement():
+def test_voice_rumore_speaks_distinct_motivos_once():
     r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO),
-        _entry(gruppo=Gruppo.RUMORE, contact_id="c2"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Schanty", motivo="**passero** trovato, alla Lipu"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Miri", contact_id="c2", motivo="conversazione chiusa"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Paolo", contact_id="c3", motivo="conversazione chiusa."),
     )
     voice = render_voice(r)
-    assert "C'è una conversazione in corso, presidiata, più una voce di rumore di fondo." in voice
-    assert "Ci sono una" not in voice
-    assert "più una voci" not in voice
+    assert "Nel rumore di fondo, passero trovato, alla Lipu; conversazione chiusa." in voice
+    assert "**" not in voice
+    assert voice.count("conversazione chiusa") == 1  # deduped: said once, not three times
 
 
-def test_voice_panoramica_singular_uncovered():
-    r = _result(_entry(gruppo=Gruppo.IN_CORSO, presidio=Presidio.SCOPERTA))
-    assert "C'è una conversazione in corso, ancora scoperta." in render_voice(r)
+def test_voice_rumore_falls_back_to_count_without_distinct_motivos():
+    rum = [
+        _entry(gruppo=Gruppo.RUMORE, nome="A", motivo=""),
+        _entry(gruppo=Gruppo.RUMORE, nome="B", contact_id="c2", motivo="."),
+    ]
+    assert _voice_rumore(rum) == "Ci sono due voci di rumore di fondo."
 
 
-def test_voice_panoramica_rumore_only_agrees_with_its_own_count():
-    one = _result(_entry(gruppo=Gruppo.RUMORE))
-    assert "C'è una voce di rumore di fondo." in render_voice(one)
-    three = _result(*(_entry(gruppo=Gruppo.RUMORE, contact_id=f"c{i}") for i in range(3)))
-    assert "Ci sono tre voci di rumore di fondo." in render_voice(three)
+def test_voice_rumore_count_agrees_with_its_count():
+    assert _voice_rumore_count([_entry(gruppo=Gruppo.RUMORE)]) == "C'è una voce di rumore di fondo."
+    three = [_entry(gruppo=Gruppo.RUMORE, contact_id=f"c{i}") for i in range(3)]
+    assert _voice_rumore_count(three) == "Ci sono tre voci di rumore di fondo."
 
 
-def test_voice_panoramica_plural_verb_with_singular_tail():
-    # Con soggetti coordinati da "più" il verbo accorda col PRIMO, non col totale.
-    r = _result(
-        _entry(gruppo=Gruppo.IN_CORSO),
-        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2"),
-        _entry(gruppo=Gruppo.RUMORE, contact_id="c3"),
+# --- VOCALE: accordo di numero (il vocale va in TTS: un errore si SENTE) --------
+
+
+def test_voice_number_agreement_never_mismatches():
+    # Sweep the surviving count constructs directly. Forbidden = every number/gender
+    # mismatch, plus the orphan pronoun "Una aspetta" (one narrated -> pronoun-free form).
+    bad = (
+        "Ci sono una ", "C'è due ", "C'è tre ", "C'è quattro ", "C'è cinque ",
+        "una conversazioni", "una voci",
+        "due conversazione in corso", "tre conversazione in corso",
+        "tutte presidiata", "tutte ancora scoperta", "una ancora scoperte",
+        "due voce di rumore", "tre voce di rumore",
+        "Una aspetta", "una aspettano", "Di queste, una ",  # one uncovered -> the NAME
+        "due aspetta ", "tre aspetta ", "quattro aspetta ", "cinque aspetta ",
+        "E altre una ", "un'altra due", "un'altra conversazioni",
     )
-    voice = render_voice(r)
-    assert (
-        "Ci sono due conversazioni in corso, tutte presidiate, più una voce di rumore di fondo."
-        in voice
-    )
 
+    def check(text: str, ctx: str) -> None:
+        for b in bad:
+            assert b not in text, f"{ctx}: {text!r}"
 
-def test_voice_panoramica_after_urgent_has_no_verb():
-    r = _result(
-        _entry(gruppo=Gruppo.SUBITO, motivo="bloccato in farmacia", presidio=Presidio.SCOPERTA),
-        _entry(gruppo=Gruppo.IN_CORSO, contact_id="c2"),
-    )
-    voice = render_voice(r)
-    assert "Per il resto, una conversazione in corso, presidiata." in voice
-    assert "Ci sono" not in voice and "C'è" not in voice
+    for r in range(1, 6):  # rumore count fallback
+        check(_voice_rumore_count([_entry(gruppo=Gruppo.RUMORE, contact_id=f"r{i}") for i in range(r)]), f"rumore r={r}")
 
-
-def test_voice_panoramica_never_mismatches_number():
-    mismatches = (
-        "Ci sono una ",
-        "C'è due ",
-        "C'è tre ",
-        "una conversazioni",
-        "una voci",
-        "due conversazione in corso",
-        "tre conversazione in corso",
-        "tutte presidiata",
-        "tutte ancora scoperta",
-        "una ancora scoperte",
-        "due voce di rumore",
-    )
-    for scoperte in (False, True):
-        presidio = Presidio.SCOPERTA if scoperte else Presidio.PRESIDIATA
-        for n_corso in range(4):
-            for n_rumore in range(4):
-                entries = [
-                    _entry(gruppo=Gruppo.IN_CORSO, contact_id=f"i{i}", presidio=presidio)
-                    for i in range(n_corso)
-                ] + [_entry(gruppo=Gruppo.RUMORE, contact_id=f"r{i}") for i in range(n_rumore)]
-                voice = render_voice(_result(*entries))
-                for bad in mismatches:
-                    assert bad not in voice, f"{n_corso}+{n_rumore} scoperte={scoperte}: {voice!r}"
+    for n in range(1, 6):  # waiting closing + cap tail, over every presidio mix
+        for scoperte in range(n + 1):
+            entries = [
+                _entry(
+                    gruppo=Gruppo.IN_CORSO,
+                    contact_id=f"i{i}",
+                    presidio=Presidio.SCOPERTA if i < scoperte else Presidio.PRESIDIATA,
+                )
+                for i in range(n)
+            ]
+            check(_voice_in_corso_waiting(entries), f"waiting n={n} scoperte={scoperte}")
+            check(_voice_in_corso_tail(entries), f"tail n={n} scoperte={scoperte}")
 
 
 # --- Helpers, container, determinism -------------------------------------------

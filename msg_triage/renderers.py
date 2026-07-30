@@ -10,10 +10,11 @@ renderers only lay it out — they never re-summarize prose.
 - ``render_table``  = cruscotto operativo: una riga per conversazione con l'azione da
                       fare (``azione_suggerita``, ripiego su ``motivo``); testo semplice,
                       niente tabelle monospace fragili su Telegram mobile.
-- ``render_voice``  = sintetico, pensato per la sintesi vocale: apre dall'urgenza,
-                      narra solo gli item "da gestire subito" (dal campo breve
-                      ``motivo``, non dal paragrafo ``stato_sintetico``) e riassume
-                      il resto in una frase di panoramica.
+- ``render_voice``  = schema raccontato per l'ascolto: apre dall'urgenza, narra OGNI
+                      conversazione una frase — col nome, dal campo breve ``motivo``
+                      (+ azione), mai dal paragrafo ``stato_sintetico`` — e comprime il
+                      rumore in una frase cumulativa. Prosa continua, niente simboli né
+                      elenchi.
 
 Both HTML formats treat RUMORE as a group rather than as conversations: it requires no
 action, so it carries one neutral ⚪ and none of the presidio/temperatura marks (the
@@ -328,18 +329,28 @@ def _table_row(entry: ConversationTriage) -> str:
     return f"{symbols} {name} — {body}"
 
 
-# --- VOCALE: synthetic, TTS-oriented -------------------------------------------
+# --- VOCALE: schema raccontato, TTS-oriented -----------------------------------
+
+_VOICE_IN_CORSO_CAP = 6  # narrate this many IN CORSO in full; compress the rest to a count
+_VOICE_WAITING_MIN = 3  # emit the presidio closing only from this many narrated IN CORSO up
 
 
 def render_voice(result: TriageResult) -> str:
-    """Synthetic and TTS-oriented: opens with the urgency, narrates only the SUBITO
-    items, then one panoramica sentence for the rest. No bullet lists."""
+    """Schema raccontato per l'ascolto (TTS): opens with the urgency (SUBITO) or
+    "Niente di urgente.", narrates every IN CORSO one sentence each — by name, from the
+    one-line ``motivo`` (+ azione), capped, with a presidio closing — and folds RUMORE
+    into one cumulative sentence. Continuous prose: no symbols, no tags, no bullet lists.
+    """
     if not result.conversations:
         return _EMPTY_VOICE
     subito, in_corso, rumore = _bucket(result)
     opener = _voice_urgent(subito) if subito else "Niente di urgente."
-    panoramica = _panoramica(in_corso, rumore, after_urgent=bool(subito))
-    return "\n\n".join(p for p in (opener, panoramica) if p)
+    parts = [
+        opener,
+        _voice_in_corso(in_corso, after_urgent=bool(subito)),
+        _voice_rumore(rumore),
+    ]
+    return " ".join(p for p in parts if p)  # one continuous paragraph for TTS
 
 
 def _voice_urgent(subito: list[ConversationTriage]) -> str:
@@ -352,58 +363,124 @@ def _voice_urgent(subito: list[ConversationTriage]) -> str:
 
 def _voice_item(entry: ConversationTriage) -> str:
     # Voce = sintetico: si legge `motivo` (frase secca di una riga, per costruzione),
-    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Poi l'azione. Il
-    # marcatore `**specie**` va tolto: il vocale è testo pulito (niente tag, niente **).
-    spoken = _as_sentence(_strip_species_marker(" ".join(entry.motivo.split())))
+    # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Il nome va anteposto: chi
+    # ascolta non ha contesto davanti e `motivo` non porta il nome del cliente. Senza
+    # virgola — "{nome} {motivo}" scorre con tutte le forme reali di motivo, verbo
+    # ("Tramontana chiede se può passare") e participio ("Verdi bloccato in farmacia");
+    # verificato all'ascolto che la virgola separava soggetto e verbo e si sentiva
+    # ("Tramontana, chiede"). Il marcatore `**specie**` va tolto: il vocale è testo pulito
+    # (niente tag, niente **).
+    motivo = _strip_species_marker(" ".join(entry.motivo.split())).strip()
+    name = entry.nome.strip()
+    spoken = _as_sentence(f"{name} {motivo}" if name and motivo else (name or motivo))
     action = _strip_species_marker(entry.azione_suggerita.strip())
     if action:
-        action = action[:1].upper() + action[1:]
-        spoken = f"{spoken} {_as_sentence(action)}"
+        action = _as_sentence(action[:1].upper() + action[1:])
+        spoken = f"{spoken} {action}".strip()
     return spoken
 
 
-def _panoramica(
-    in_corso: list[ConversationTriage],
-    rumore: list[ConversationTriage],
-    *,
-    after_urgent: bool,
-) -> str:
-    """One sentence aggregating the non-urgent rest: counts + presidio check.
+def _voice_in_corso(in_corso: list[ConversationTriage], *, after_urgent: bool) -> str:
+    """Narrate the IN CORSO one sentence each (capped at ``_VOICE_IN_CORSO_CAP``), then a
+    presidio closing over the narrated ones, then — if capped — a count tail for the rest.
+    Entries arrive urgency-sorted from :func:`_bucket`, so the cap keeps the most urgent.
 
-    Every inflecting piece goes through :func:`_agree`, the opening verb included:
-    with subjects coordinated by "più", Italian agrees with the FIRST one, so the
-    verb follows ``counts[0]`` and not the total ("C'è una conversazione in corso,
-    presidiata, più due voci di rumore di fondo").
+    After the urgent block the first sentence opens with "Per il resto, ": speech has no
+    blank line to mark the change of register, so without the connective the listener
+    slides from the last urgent item straight into the routine ones with no warning. With
+    no SUBITO the "Niente di urgente." opener already does that job and the block starts
+    directly.
     """
-    segments: list[str] = []
-    counts: list[int] = []
-    if in_corso:
-        counts.append(len(in_corso))
-        segments.append(_panoramica_in_corso(in_corso))
-    if rumore:
-        r = len(rumore)
-        counts.append(r)
-        segments.append(f"{_count_word(r)} {_agree(r, 'voce', 'voci')} di rumore di fondo")
-    if not segments:
-        return "Non c'è altro da segnalare." if after_urgent else ""
-    body = ", più ".join(segments)
-    if after_urgent:  # "Per il resto, ..." — nessun verbo, niente da accordare
-        return f"Per il resto, {body}."
-    verb = _agree(counts[0], "C'è", "Ci sono")  # accorda col primo soggetto, non col totale
-    return f"{verb} {body}."
+    if not in_corso:
+        return ""
+    cap = _VOICE_IN_CORSO_CAP
+    capped = cap is not None and len(in_corso) > cap
+    narrated = in_corso[:cap] if capped else in_corso
+    parts = [_voice_item(entry) for entry in narrated]
+    if after_urgent and parts[0]:
+        parts[0] = f"Per il resto, {parts[0]}"
+    waiting = _voice_in_corso_waiting(narrated)
+    if waiting:
+        parts.append(waiting)
+    if capped:
+        parts.append(_voice_in_corso_tail(in_corso[cap:]))
+    return " ".join(p for p in parts if p)
+
+
+def _voice_in_corso_waiting(narrated: list[ConversationTriage]) -> str:
+    """Presidio closing over the narrated IN CORSO: WHO still awaits a reply. Keeps the
+    "scoperta" signal alive even when the cap never fires (the common ≤6 day).
+
+    Only from ``_VOICE_WAITING_MIN`` narrated up: with one or two voices the closing would
+    repeat, a sentence later, what the listener has just heard ("Tramontana chiede… /
+    Tramontana aspetta ancora risposta"). It earns its place when the voices are many and
+    you no longer remember which one was uncovered.
+
+    One uncovered → say the NAME ("Tramontana aspetta ancora risposta."): the name is the
+    part the listener can act on, where a bare "una" would be a pronoun without an
+    antecedent. From two up, the names would become a list too long to listen to, so it
+    falls back to the count anchored by "queste". Returns "" when all are presidiate.
+    """
+    if len(narrated) < _VOICE_WAITING_MIN:
+        return ""
+    uncovered = [e for e in narrated if e.presidio is Presidio.SCOPERTA]
+    if not uncovered:
+        return ""
+    if len(uncovered) == 1:
+        name = uncovered[0].nome.strip()
+        tail = f"{name} aspetta ancora risposta" if name else "Una conversazione aspetta ancora risposta"
+        return _as_sentence(tail)
+    return f"Di queste, {_count_word(len(uncovered))} aspettano ancora risposta."
+
+
+def _voice_in_corso_tail(overflow: list[ConversationTriage]) -> str:
+    """Count tail for the IN CORSO beyond the cap, carrying its own presidio clause."""
+    if len(overflow) == 1:
+        scoperte = 1 if overflow[0].presidio is Presidio.SCOPERTA else 0
+        return _as_sentence(f"E un'altra conversazione in corso, {_presidio_clause(1, scoperte)}")
+    return _as_sentence(f"E altre {_panoramica_in_corso(overflow)}")
+
+
+def _voice_rumore(rumore: list[ConversationTriage]) -> str:
+    """One cumulative closing sentence for the noise. Content-based: the DISTINCT motivos
+    (deduped with the schema's key + first-appearance order), so a routed found-animal
+    surfaces while a repeated generic motivo is said once. Falls back to a plain count
+    when nothing distinct remains (empty/degenerate motivos).
+    """
+    if not rumore:
+        return ""
+    keys: list[str] = []
+    for entry in rumore:
+        key = entry.motivo.strip().rstrip(".")  # same normalization as _schema_rumore_section
+        if key and key not in keys:
+            keys.append(key)
+    if not keys:
+        return _voice_rumore_count(rumore)
+    parts = [_strip_species_marker(" ".join(k.split())) for k in keys]
+    return _as_sentence("Nel rumore di fondo, " + "; ".join(parts))
+
+
+def _voice_rumore_count(rumore: list[ConversationTriage]) -> str:
+    """Plain count fallback, with number agreement (verb + voce/voci)."""
+    r = len(rumore)
+    verb = _agree(r, "C'è", "Ci sono")
+    return f"{verb} {_count_word(r)} {_agree(r, 'voce', 'voci')} di rumore di fondo."
+
+
+def _presidio_clause(n: int, scoperte: int) -> str:
+    """Presidio agreement shared by the in-corso count phrasings (panoramica + cap tail)."""
+    if scoperte == 0:
+        return _agree(n, "presidiata", "tutte presidiate")
+    if scoperte == n:
+        return _agree(n, "ancora scoperta", "tutte ancora scoperte")
+    return f"{_count_word(scoperte)} ancora {_agree(scoperte, 'scoperta', 'scoperte')}"
 
 
 def _panoramica_in_corso(in_corso: list[ConversationTriage]) -> str:
     n = len(in_corso)
     noun = _agree(n, "conversazione in corso", "conversazioni in corso")
     scoperte = sum(1 for e in in_corso if e.presidio is Presidio.SCOPERTA)
-    if scoperte == 0:
-        presidio = _agree(n, "presidiata", "tutte presidiate")
-    elif scoperte == n:
-        presidio = _agree(n, "ancora scoperta", "tutte ancora scoperte")
-    else:
-        presidio = f"{_count_word(scoperte)} ancora {_agree(scoperte, 'scoperta', 'scoperte')}"
-    return f"{_count_word(n)} {noun}, {presidio}"
+    return f"{_count_word(n)} {noun}, {_presidio_clause(n, scoperte)}"
 
 
 # --- Convenience container (fields = T7 triage_runs columns) -------------------
