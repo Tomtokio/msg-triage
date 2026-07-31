@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -112,6 +113,47 @@ class TriageResult:
     """The whole triage: one entry per conversation the model returned."""
 
     conversations: tuple[ConversationTriage, ...]
+
+
+# --- Species marker (part of what the model emits) -----------------------------
+#
+# The prompt tells the model to wrap the animal's species in double asterisks every
+# time it names it ("la **tartaruga** Ruga" — docs/triage_system_prompt.md, "Come
+# scrivere"). It is a rendering hint first (renderers turn it into ``<i>``), but it
+# is also the only place the species appears in a machine-readable form, so T7
+# persistence reads it from here instead of asking the model for one more field.
+# Only balanced pairs match: a lone marker stays literal and can never open an
+# ``<i>`` that isn't closed.
+
+SPECIES_MARKER = re.compile(r"\*\*(.+?)\*\*")
+
+# Beyond this many characters the marked text is a whole clause, not a species: the
+# model broke the "marca solo la specie" rule and we would store a sentence in a
+# column meant for one word. NULL is the better answer.
+_MAX_SPECIES_LEN = 40
+
+
+def extract_species(entry: ConversationTriage) -> str | None:
+    """The species named in a triage entry, or ``None``.
+
+    Reads the first ``**...**`` marker across ``motivo`` (the shortest, most factual
+    field), then ``stato_sintetico``, then ``azione_suggerita``.
+
+    ``None`` IS THE EXPECTED OUTCOME for a good share of the entries, and it is not a
+    defect of this function: the model marks the species when it names it ("la
+    **tartaruga** Bianca") and it does not always name it ("la dimissione del
+    coniglio"). The fallback chain is the mitigation; if the hit rate ever looks too
+    low, the cure is to reinforce the rule in the prompt, not to loosen the parsing
+    here — a looser regex would only produce wrong species, which is worse than none.
+    """
+    for field in (entry.motivo, entry.stato_sintetico, entry.azione_suggerita):
+        match = SPECIES_MARKER.search(field)
+        if match is None:
+            continue
+        species = " ".join(match.group(1).split())
+        if species and len(species) <= _MAX_SPECIES_LEN:
+            return species
+    return None
 
 
 # --- System prompt loading (single source of truth in docs/) -------------------

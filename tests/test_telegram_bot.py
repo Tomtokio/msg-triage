@@ -38,8 +38,9 @@ _COMPLETE_ENV = {
     "ANTHROPIC_API_KEY": "an-key",
     "TELEGRAM_BOT_TOKEN": "123456:ABC-fake-token",
     "TELEGRAM_ALLOWED_USER_ID": "123456789",
-    "SUPABASE_URL": "https://example.supabase.co",
-    "SUPABASE_KEY": "sb-key",
+    # Placeholders, as in production today: no test can reach Supabase by accident.
+    "SUPABASE_URL": "unused",
+    "SUPABASE_KEY": "unused",
 }
 
 
@@ -188,13 +189,17 @@ def test_run_triage_pipeline_fetches_triages_renders():
     adapter = _FakeAdapter(conversations=["conv"])  # engine is faked; content ignored
     engine = _FakeEngine(result)
 
-    got_result, rendered = run_triage_pipeline(_config(), 12.0, adapter=adapter, engine=engine)
+    got_result, rendered, conversations = run_triage_pipeline(
+        _config(), 12.0, adapter=adapter, engine=engine
+    )
 
     assert got_result is result
     assert rendered == render_all(result)
     assert adapter.calls == [12.0]  # window forwarded to the adapter
     # SEAM T4: memory not wired — triage is called without previous_state.
     assert engine.calls == [(["conv"], None)]
+    # The neutral conversations come back too: T7 reads last_message_at from them.
+    assert conversations == ["conv"]
 
 
 def test_run_triage_pipeline_empty_window():
@@ -202,10 +207,13 @@ def test_run_triage_pipeline_empty_window():
     adapter = _FakeAdapter(conversations=[])
     engine = _FakeEngine(empty)
 
-    result, rendered = run_triage_pipeline(_config(), 6.0, adapter=adapter, engine=engine)
+    result, rendered, conversations = run_triage_pipeline(
+        _config(), 6.0, adapter=adapter, engine=engine
+    )
 
     assert result.conversations == ()
     assert rendered.schema_text  # renderers return the Italian empty-state string
+    assert conversations == []
 
 
 # --- delivery ------------------------------------------------------------------
@@ -254,12 +262,33 @@ def test_triage_command_rejects_overlapping_run():
     assert "già in corso" in message.replies[0]
 
 
+def _record_saves(monkeypatch, message) -> list[dict]:
+    """Swap the T7 save for a recorder that also snapshots how much was delivered."""
+    saves: list[dict] = []
+
+    def fake_save(config, result, rendered, conversations, *, window_hours):
+        saves.append(
+            {
+                "result": result,
+                "rendered": rendered,
+                "conversations": conversations,
+                "window_hours": window_hours,
+                "replies_so_far": len(message.replies),
+            }
+        )
+        return True
+
+    monkeypatch.setattr(telegram_bot, "save_triage_run", fake_save)
+    return saves
+
+
 def test_triage_command_handles_empty_window(monkeypatch):
     empty = _result()
     monkeypatch.setattr(
-        telegram_bot, "run_triage_pipeline", lambda config, hours: (empty, render_all(empty))
+        telegram_bot, "run_triage_pipeline", lambda config, hours: (empty, render_all(empty), [])
     )
     message = _FakeMessage()
+    saves = _record_saves(monkeypatch, message)
     context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
 
     asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
@@ -267,15 +296,17 @@ def test_triage_command_handles_empty_window(monkeypatch):
     # Status message + one "nessuna conversazione" line; no format messages.
     assert len(message.replies) == 2
     assert "Nessuna conversazione" in message.replies[1]
+    assert saves == []  # a triage_runs row implies conversations: nothing to save
 
 
 def test_triage_command_delivers_three_formats(monkeypatch):
     result = _result(_triage_entry())
     rendered = render_all(result)
     monkeypatch.setattr(
-        telegram_bot, "run_triage_pipeline", lambda config, hours: (result, rendered)
+        telegram_bot, "run_triage_pipeline", lambda config, hours: (result, rendered, ["conv"])
     )
     message = _FakeMessage()
+    _record_saves(monkeypatch, message)
     context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=["12"])
 
     asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
@@ -286,6 +317,28 @@ def test_triage_command_delivers_three_formats(monkeypatch):
     assert "SCHEMA" in message.replies[1]
     assert "TABELLA" in message.replies[2]
     assert "VOCALE" in message.replies[3]
+
+
+def test_triage_command_saves_the_run_after_delivering_it(monkeypatch):
+    result = _result(_triage_entry())
+    rendered = render_all(result)
+    monkeypatch.setattr(
+        telegram_bot, "run_triage_pipeline", lambda config, hours: (result, rendered, ["conv"])
+    )
+    message = _FakeMessage()
+    saves = _record_saves(monkeypatch, message)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=["12"])
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert len(saves) == 1
+    saved = saves[0]
+    assert saved["result"] is result
+    assert saved["rendered"] is rendered
+    assert saved["conversations"] == ["conv"]  # the neutral source, for last_message_at
+    assert saved["window_hours"] == 12.0
+    # Persistence is never in the critical path: all four messages were already out.
+    assert saved["replies_so_far"] == 4
 
 
 def test_triage_command_reports_pipeline_error(monkeypatch):
