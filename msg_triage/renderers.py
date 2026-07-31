@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass
 
 from .triage_engine import (
+    SPECIES_MARKER,
     ConversationTriage,
     Gruppo,
     Presidio,
@@ -232,7 +233,9 @@ def _memory_clause(entry: ConversationTriage) -> str:
 # Schema and table go out as Telegram HTML. Model-authored text is escaped FIRST,
 # then we wrap OUR tags around it — never the reverse. The species italic comes from
 # a ``**specie**`` marker the model emits (docs/triage_system_prompt.md, "Come
-# scrivere"); the regex matches only balanced ``**`` pairs, so a lone marker stays
+# scrivere"); ``SPECIES_MARKER`` lives in ``triage_engine`` with the rest of the
+# model-output contract, because T7 persistence reads the same marker to fill the
+# ``specie`` column. It matches only balanced ``**`` pairs, so a lone marker stays
 # literal and can never open an ``<i>`` that isn't closed. The voice strips the
 # marker instead (plain text: no tags, no symbols).
 
@@ -250,8 +253,6 @@ _TEMPERATURA_SYMBOL = {Temperatura.ALTA: "🔥", Temperatura.MEDIA: "⚠️", Te
 # temperatura marks. Same glyph as the "bassa" urgency dot by coincidence — its own
 # constant because the two meanings are unrelated and must be free to drift apart.
 _RUMORE_DOT = "⚪"
-
-_SPECIES_MARKER = re.compile(r"\*\*(.+?)\*\*")  # only balanced pairs -> <i>...</i>
 
 
 def _table_symbols(entry: ConversationTriage) -> str:
@@ -286,12 +287,12 @@ def _html(raw: str) -> str:
     """Escape model text for Telegram HTML, then turn the ``**specie**`` marker into
     ``<i>specie</i>``. Escape first so any ``< > &`` the client typed become entities;
     our italic tags are added around the already-escaped text."""
-    return _SPECIES_MARKER.sub(r"<i>\1</i>", html.escape(raw, quote=False))
+    return SPECIES_MARKER.sub(r"<i>\1</i>", html.escape(raw, quote=False))
 
 
 def _strip_species_marker(raw: str) -> str:
     """Drop the ``**`` species marker for the voice (plain text: no tags, no marks)."""
-    return _SPECIES_MARKER.sub(r"\1", raw)
+    return SPECIES_MARKER.sub(r"\1", raw)
 
 
 # --- SCHEMA: three-level prose, complete giornale di bordo ---------------------

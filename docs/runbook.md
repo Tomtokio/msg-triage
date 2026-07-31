@@ -67,7 +67,8 @@ La unit di riferimento è versionata in [`deploy/msg-triage.service`](../deploy/
    Variabili richieste al boot: `CALLBELL_API_KEY`, `ANTHROPIC_API_KEY`,
    `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID` (id numerico Telegram),
    `SUPABASE_URL`, `SUPABASE_KEY`. Le ultime due sono richieste **anche se** Supabase non è
-   ancora usato: se mancano, l'app non parte. `LOG_LEVEL` è opzionale (default `INFO`).
+   ancora usato: se mancano, l'app non parte — lasciare `unused` finché non si applica la
+   migration (§ E). `LOG_LEVEL` è opzionale (default `INFO`).
 
 5. **Smoke test in foreground** (ancora come `msgtriage`, prima di installare il servizio):
    ```
@@ -156,6 +157,94 @@ sudo systemctl status msg-triage
   `TELEGRAM_ALLOWED_USER_ID`; ogni altro utente non riceve nulla per progetto. Verificare che
   l'id in `.env` sia quello giusto. Controllare anche che non ci sia un secondo poller attivo
   (es. uno smoke test dimenticato in foreground → 409 Conflict nei log).
+
+---
+
+## E. Supabase — applicare la migration e accendere la persistenza
+
+Una tantum. Finché non si fanno questi passi il bot funziona identico a prima: non salva
+niente e non se ne lamenta (un `logger.debug`, non un errore).
+
+Progetto: **`agents-telemetry`** (ref `hmbyxyyckvfbbfcjyhad`, eu-west-1).
+Schema: **`msg_triage`**. File: [`migrations/0001_msg_triage_schema.sql`](../migrations/0001_msg_triage_schema.sql).
+
+> **L'ordine conta:** prima l'SQL, poi gli Exposed schemas, poi la chiave. Saltando il
+> secondo passo PostgREST risponde `PGRST106` qualunque cosa faccia il codice.
+
+1. **SQL.** Dashboard Supabase → progetto `agents-telemetry` → SQL Editor → incollare tutto
+   `migrations/0001_msg_triage_schema.sql` → Run. Gira come ruolo `postgres`. Crea schema,
+   quattro tabelle, indici, RLS attiva senza policy e i grant per `service_role`.
+
+2. **Exposed schemas.** Settings → API → Data API → **Exposed schemas**: aggiungere
+   `msg_triage` a fianco di quelli già presenti (non sostituirli), Save. Senza questo passo
+   lo schema custom non esiste per PostgREST.
+
+3. **La chiave: service_role in formato JWT LEGACY (`eyJh…`), non `sb_secret_…`.**
+   Settings → API Keys → sezione delle chiavi legacy/JWT (su alcuni progetti va prima
+   riabilitata). Il formato nuovo non porta il claim di ruolo che PostgREST usa quando cambia
+   profilo su uno schema custom: il sintomo è un errore di permessi che *sembra* un grant
+   mancante, e si perde un pomeriggio a cercarlo nella migration.
+
+4. **`.env` sul VPS.** Come `msgtriage` (`sudo -u msgtriage -i`, file `~/msg-triage/.env`,
+   permessi 0600):
+   ```
+   SUPABASE_URL=https://hmbyxyyckvfbbfcjyhad.supabase.co
+   SUPABASE_KEY=eyJh…          # service_role, formato legacy
+   ```
+   poi, dall'account con sudo: `sudo systemctl restart msg-triage` — la config si legge
+   **solo** allo startup.
+
+5. **Verifica.** Da Telegram: `/triage`. Nei log deve comparire
+   `Saved triage run <uuid> (N conversation states)`:
+   ```
+   sudo journalctl -u msg-triage -n 50 | grep -Ei 'supabase|saved triage run'
+   ```
+   Poi nella SQL Editor:
+   ```sql
+   select id, created_at, window_hours, n_conversations
+   from msg_triage.triage_runs order by created_at desc limit 1;
+
+   select contact_id, nome, gruppo, urgenza, presidio, specie, last_message_at
+   from msg_triage.conversation_states
+   where run_id = (select id from msg_triage.triage_runs order by created_at desc limit 1);
+   ```
+
+6. **Copertura del campo `specie`** (da rilanciare ogni tanto, non solo al primo giro):
+   ```sql
+   select count(*) filter (where specie is not null) as con_specie,
+          count(*)                                   as totale,
+          round(100.0 * count(*) filter (where specie is not null) / nullif(count(*), 0)) as pct
+   from msg_triage.conversation_states
+   where created_at > now() - interval '7 days';
+   ```
+   **Una buona percentuale di `NULL` è attesa e non è un bug dell'estrazione.** Il modello
+   marca la specie quando la nomina («la **tartaruga** Bianca») e non la nomina sempre («la
+   dimissione del coniglio»). Il codice cerca il marcatore in `motivo`, poi in
+   `stato_sintetico`, poi in `azione_suggerita`: quella catena di ripiego è già la
+   mitigazione. **Se la percentuale è bassa, la cura è rinforzare la regola in
+   `docs/triage_system_prompt.md`, non toccare l'estrazione** — allentare il parsing
+   produrrebbe specie sbagliate, che sono peggio di nessuna specie.
+
+### Se qualcosa non va
+
+Il triage arriva **comunque** su Telegram: la persistenza è best-effort e un fallimento è un
+WARNING nel journal, mai un errore per l'utente. Il messaggio dice quale dei tre passi manca:
+
+| Nel log | Cosa manca |
+|---|---|
+| `PGRST106` (schema non exposed) | passo 2 |
+| `42501` / permission denied | passo 3 (chiave nel formato sbagliato) |
+| `PGRST205` (tabella non trovata) | passo 1, oppure PostgREST non ha ricaricato: rilanciare `notify pgrst, 'reload schema';` |
+| `ConnectionError` / `Timeout` | rete del VPS verso Supabase |
+
+I log riportano status e `code`/`message` di PostgREST, **mai** `details`/`hint`: quelli
+riecheggerebbero la riga rifiutata, cioè nomi di clienti, dentro il journal.
+
+### Retention
+
+Non attiva: lo snippet è in fondo al file della migration, commentato. Consigliata —
+90 giorni per `triage_runs` (`conversation_states` cade a cascata), 12 mesi per le tabelle
+di T10. Da lanciare a mano quando serve.
 
 ---
 

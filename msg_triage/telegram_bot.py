@@ -3,12 +3,16 @@
 Read-only toward clients: it never replies to WhatsApp, it only delivers the
 triage to the authorized operator on Telegram. It orchestrates the working
 pipeline T2 (fetch) -> T3 (triage) -> T5 (render) and sends the three formats as
-three distinct messages (dev_notes: never one block).
+three distinct messages (dev_notes: never one block), then saves the run (T7).
+
+The save comes AFTER delivery, in its own thread hop: persistence is best-effort
+and must never sit in the critical path, not even as latency. It cannot raise (see
+:func:`~msg_triage.storage.save_triage_run`), so it needs no guard here.
 
 Not wired yet (seams in place, no rework when they land):
 - T4 memory: ``triage`` is called without ``previous_state``; ``_memory_clause``
-  in the renderers still returns ``""``.
-- T7 persistence: nothing is saved.
+  in the renderers still returns ``""``. The state it will read is now being
+  written by T7.
 - T6 audio (TTS): the "vocale" is delivered as text; the single swap point is
   marked ``SEAM T6`` in :func:`_deliver_triage`.
 
@@ -30,6 +34,8 @@ from typing import TYPE_CHECKING
 from msg_triage.callbell_adapter import CallbellError, build_adapter
 from msg_triage.config import Config
 from msg_triage.renderers import RenderedTriage, render_all
+from msg_triage.source_adapter import Conversation
+from msg_triage.storage import save_triage_run
 from msg_triage.triage_engine import TriageError, TriageResult, build_triage_engine
 
 if TYPE_CHECKING:  # annotations only — no runtime telegram dependency here
@@ -137,20 +143,24 @@ def run_triage_pipeline(
     *,
     adapter=None,
     engine=None,
-) -> tuple[TriageResult, RenderedTriage]:
-    """Run the synchronous T2 -> T3 -> T5 pipeline; return the result + rendering.
+) -> tuple[TriageResult, RenderedTriage, list[Conversation]]:
+    """Run the synchronous T2 -> T3 -> T5 pipeline; return result, rendering, source.
 
     Blocking (requests + anthropic): the async handler runs it via
     ``asyncio.to_thread``. ``adapter``/``engine`` are injectable for tests; when
-    omitted they are built from ``config``. Memory (T4) and persistence (T7) are not
-    wired — ``triage`` is called without ``previous_state`` and nothing is saved.
+    omitted they are built from ``config``. Memory (T4) is not wired — ``triage`` is
+    called without ``previous_state``.
+
+    The neutral conversations come back too because persistence needs
+    ``last_message_at``, which lives on the source conversation and not on the triage
+    judgment. They stay in the neutral format, so nothing Callbell-specific travels.
     """
     adapter = adapter if adapter is not None else build_adapter(config)
     conversations = adapter.fetch_recent_conversations(window_hours=hours)
     engine = engine if engine is not None else build_triage_engine(config)
     result = engine.triage(conversations)  # SEAM T4: previous_state intentionally omitted
     rendered = render_all(result)
-    return result, rendered
+    return result, rendered, conversations
 
 
 def _hours_label(hours: float) -> str:
@@ -216,7 +226,9 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"🔍 Recupero le conversazioni delle ultime {label} e le analizzo…"
         )
         try:
-            result, rendered = await asyncio.to_thread(run_triage_pipeline, config, hours)
+            result, rendered, conversations = await asyncio.to_thread(
+                run_triage_pipeline, config, hours
+            )
         except (CallbellError, TriageError) as exc:
             logger.warning("Triage fallito: %s", exc)
             await message.reply_text(f"⚠️ Errore durante il triage: {exc}")
@@ -229,12 +241,18 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if not result.conversations:
+            # Nothing to save either: a triage_runs row implies conversations.
             await message.reply_text(
                 f"✅ Nessuna conversazione con attività nelle ultime {label}."
             )
             return
 
         await _deliver_triage(message, rendered)
+
+        # T7: best-effort, after delivery, off the event loop. Cannot raise.
+        await asyncio.to_thread(
+            save_triage_run, config, result, rendered, conversations, window_hours=hours
+        )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

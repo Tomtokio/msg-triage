@@ -6,8 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40",
     "python-telegram-bot>=21.0",   # v21+ è async → impatta T8, qui solo dichiarata
-    "requests>=2.31",
-    "supabase>=2.0",
+    "requests>=2.31",              # Callbell e Supabase (PostgREST): un solo client HTTP
     "python-dotenv>=1.0",          # carica .env in locale
 ]
 
