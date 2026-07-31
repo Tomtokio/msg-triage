@@ -144,6 +144,76 @@ def _as_sentence(text: str) -> str:
     return text
 
 
+# Courtesy titles the model puts in front of a client name ("Sig.ra Rossi", "il signor
+# Neri"). A flat list of literal forms, NOT a hand-rolled morphology (``sig(?:\.ra)?``):
+# it grows by one string instead of by an arm nobody re-reads. What makes it safe to
+# extend is the MANDATORY trailing ``\s+`` — a title can never eat the head of a real
+# word ("signora" cannot open "signorina", "sig" cannot open "Sigla"), the engine just
+# backtracks. Longest-first so the first attempt is the right one.
+_NAME_TITLES = (
+    "sig.", "sig.ra", "sig.na", "sig",
+    "signor", "signore", "signora", "signorina",
+    "dott.", "dott.ssa", "dottor", "dottore", "dottoressa",
+    "dr.", "dr.ssa",
+)
+# The article lives INSIDE the group and the title is mandatory there: "la signora Rossi"
+# strips, a bare "La Rossi" does not — an article alone never triggers a removal.
+_NAME_TITLE = (
+    r"(?:(?:il|lo|la)\s+|l')?(?:"
+    + "|".join(re.escape(t) for t in sorted(_NAME_TITLES, key=len, reverse=True))
+    + r")\s+"
+)
+_NAME_TITLE_PREFIX = re.compile(rf"^{_NAME_TITLE}", re.IGNORECASE)
+
+
+def _strip_leading_name(text: str, nome: str) -> str:
+    """Drop the client's name from the OPENING of model text, or return it untouched.
+
+    Il nome del cliente è un CAMPO (``nome``, che viene dalla sorgente e non dal
+    modello), non parte del testo: è l'interfaccia a metterlo dove serve — grassetto in
+    tabella, lead-in nel vocale. Quando il modello lo scrive anche dentro ``motivo``
+    esce due volte ("Silvia Silvia chiede un appuntamento", "Dati — Sig. Dati:
+    dimissione fissata"). Il prompt ora lo vieta; questa è la rete deterministica che
+    chiude il caso invece di fidarsi.
+
+    Case-insensitive: ``nome`` è il contatto Callbell com'è scritto lì ("Di ruscio"), il
+    modello lo scrive per bene ("Di Ruscio"). Titolo tollerato su ENTRAMBI i lati — uno
+    tolto dal nome memorizzato ("Sig.ra Rossi" -> "Rossi"), uno ammesso davanti al testo
+    ("la signora Rossi") — che è esattamente il caso su cui la vecchia
+    ``_dedup_leading_name`` (rimossa in #15) rinunciava, e quello che si vede dal vivo.
+
+    Il titolo non è mai tolto da solo: è un gruppo opzionale dentro un pattern il cui
+    resto obbligatorio è il nome, quindi un titolo di troppo nella lista non può rovinare
+    testo — può solo non trovare il nome. Ancorato a ``^``, perché un nome a metà frase è
+    contenuto e non ripetizione ("richiamare Rossi domani" resta intero). Il lookahead
+    ``(?![\\w-])`` e non ``\\b``: ``\\b`` fallirebbe sulle iniziali che finiscono col punto
+    ("D.R.G. chiede"), mentre così restano intatti sia il prefisso ("Sil" in "Silvia")
+    sia il doppio cognome ("Tosi" in "Tosi-Rossi"). Una sola passata: la regola è "togli
+    il nome se è in apertura", non "continua a mangiare prefissi finché qualcosa matcha".
+
+    Restituisce ``""`` quando il testo era soltanto il nome: entrambi i chiamanti hanno
+    già quel ramo (il vocale dice il nome e basta, la tabella emette la riga nuda).
+    """
+    core = _NAME_TITLE_PREFIX.sub("", nome.strip(), count=1).strip()
+    if not core:
+        # Guardia portante, non difensiva: con un nome vuoto il pattern degenera in
+        # "matcha nulla a posizione 0" e si mangia il separatore che apre il testo
+        # (": chiede la ricetta" -> "chiede la ricetta").
+        return text
+    # ``\s+`` fra i token del nome: la spaziatura memorizzata e quella scritta possono
+    # divergere ("Di ruscio" / "Di  Ruscio"). Il match gira sul testo GREZZO, così il
+    # ramo "nessun match" resta identico byte per byte — nessuna normalizzazione entra
+    # di straforo da una funzione che deve solo togliere un prefisso.
+    name = r"\s+".join(re.escape(part) for part in core.split())
+    return re.sub(
+        rf"^\s*(?:{_NAME_TITLE})?{name}(?![\w-])\s*[:,;.—–-]?\s*",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _memory_clause(entry: ConversationTriage) -> str:
     """SEAM T4 (memoria): returns ``""`` today.
 
@@ -264,6 +334,19 @@ def _schema_paragraph(entry: ConversationTriage) -> str:
     return f"{_schema_symbols(entry)} " + " ".join(parts)
 
 
+def _rumore_key(entry: ConversationTriage) -> str:
+    """Normalized ``motivo`` for RUMORE: the merge key AND the text printed after the
+    names, shared by :func:`_schema_rumore_section` and :func:`_voice_rumore`.
+
+    Both surfaces print the names themselves, so the client's name has to go BEFORE the
+    key is computed, not after: the key is the criterion and the text at once. A name
+    left inside makes every key unique and kills the merging silently — one line per
+    conversation instead of one merged line. Shared here rather than commented as "same
+    normalization" on both sides, so the three steps cannot drift apart.
+    """
+    return _strip_leading_name(entry.motivo, entry.nome).strip().rstrip(".")
+
+
 def _schema_rumore_section(entries: list[ConversationTriage]) -> str:
     if not entries:
         return f"{_H_RUMORE}\n{_EMPTY_GROUP}"
@@ -276,7 +359,7 @@ def _schema_rumore_section(entries: list[ConversationTriage]) -> str:
     # for exactly one closing mark — it also lands the period outside a trailing </i>.
     grouped: dict[str, list[str]] = {}  # motivo -> already-escaped bold names
     for entry in entries:
-        key = entry.motivo.strip().rstrip(".")
+        key = _rumore_key(entry)
         grouped.setdefault(key, []).append(f"<b>{html.escape(entry.nome, quote=False)}</b>")
     lines = [_H_RUMORE]
     for motivo, names in grouped.items():
@@ -314,14 +397,19 @@ def _table_row(entry: ConversationTriage) -> str:
     # Dashboard, not narration: the row shows the ACTION to take. ``azione_suggerita`` is
     # already a short operative line; fall back to ``motivo`` (the one-line fact) when the
     # model left no action — typical of rumore and concluded chats — and to symbols + name
-    # alone when both are empty. Rendered verbatim (no re-capitalization): azione/motivo
-    # don't lead with the client name (the bold prefix already carries it), so the old
-    # stato-prose name-dedup is gone. Truncate on the RAW text (a safety net — these fields
-    # are one-liners by design), THEN escape + italic; truncation can cut inside a
-    # ``**...**`` pair, so strip any residual marker (seen live: "il suo **parrocchetto…").
+    # alone when both are empty. Rendered verbatim (no re-capitalization). The model DOES
+    # open these fields with the client name ("Sig. Dati: dimissione fissata"), which the
+    # bold prefix already carries, so it is stripped first — on the PICKED text, so azione
+    # and motivo are both covered by one call, and on the raw string, because html.escape
+    # rewrites ``& < >`` and the name would no longer match itself. Stripping before the
+    # emptiness check lets a text that was only the name fall into the bare-row branch,
+    # and before _one_line so the 120-char budget is spent on content, not on the name.
+    # Truncate on the RAW text (a safety net — these fields are one-liners by design),
+    # THEN escape + italic; truncation can cut inside a ``**...**`` pair, so strip any
+    # residual marker (seen live: "il suo **parrocchetto…").
     symbols = _table_symbols(entry)
     name = f"<b>{html.escape(entry.nome, quote=False)}</b>"
-    text = entry.azione_suggerita.strip() or entry.motivo.strip()
+    text = _strip_leading_name(entry.azione_suggerita.strip() or entry.motivo.strip(), entry.nome)
     # SEAM T4: a terse memory tag (e.g. " [promessa scaduta]") would be appended here.
     if not text:
         return f"{symbols} {name}"
@@ -364,14 +452,19 @@ def _voice_urgent(subito: list[ConversationTriage]) -> str:
 def _voice_item(entry: ConversationTriage) -> str:
     # Voce = sintetico: si legge `motivo` (frase secca di una riga, per costruzione),
     # NON `stato_sintetico` (paragrafo: resta a schema/tabella). Il nome va anteposto: chi
-    # ascolta non ha contesto davanti e `motivo` non porta il nome del cliente. Senza
-    # virgola — "{nome} {motivo}" scorre con tutte le forme reali di motivo, verbo
-    # ("Tramontana chiede se può passare") e participio ("Verdi bloccato in farmacia");
-    # verificato all'ascolto che la virgola separava soggetto e verbo e si sentiva
-    # ("Tramontana, chiede"). Il marcatore `**specie**` va tolto: il vocale è testo pulito
-    # (niente tag, niente **).
+    # ascolta non ha contesto davanti. Senza virgola — "{nome} {motivo}" scorre con tutte
+    # le forme reali di motivo, verbo ("Tramontana chiede se può passare") e participio
+    # ("Verdi bloccato in farmacia"); verificato all'ascolto che la virgola separava
+    # soggetto e verbo e si sentiva ("Tramontana, chiede"). Il marcatore `**specie**` va
+    # tolto: il vocale è testo pulito (niente tag, niente **).
+    # Il modello, spesso, apre `motivo` col nome del cliente ("Silvia chiede un
+    # appuntamento"): anteporlo di nuovo lo raddoppierebbe, e all'ascolto un nome ripetuto
+    # è il rumore che si sente di più. Si toglie DOPO il marcatore specie e la
+    # normalizzazione degli spazi, così il match vede prosa pulita; se `motivo` era
+    # soltanto il nome resta "" e il ramo qui sotto legge il nome e basta.
     motivo = _strip_species_marker(" ".join(entry.motivo.split())).strip()
     name = entry.nome.strip()
+    motivo = _strip_leading_name(motivo, name)
     spoken = _as_sentence(f"{name} {motivo}" if name and motivo else (name or motivo))
     action = _strip_species_marker(entry.azione_suggerita.strip())
     if action:
@@ -451,7 +544,7 @@ def _voice_rumore(rumore: list[ConversationTriage]) -> str:
         return ""
     keys: list[str] = []
     for entry in rumore:
-        key = entry.motivo.strip().rstrip(".")  # same normalization as _schema_rumore_section
+        key = _rumore_key(entry)
         if key and key not in keys:
             keys.append(key)
     if not keys:

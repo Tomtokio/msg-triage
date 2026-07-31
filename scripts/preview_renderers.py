@@ -29,6 +29,9 @@ def _sample_result() -> TriageResult:
 
     Exercises: table azione-wins (Verdi, Tramontana), table motivo-fallback (Bianchi,
     every rumore), a scoperta in corso, and rumore dedup (two "conversazione chiusa").
+    Bianchi and Miri also carry the client name inside ``motivo`` — the way the model
+    writes it live — so the name must appear ONCE per line, and the two rumore voices
+    must still merge despite only one of them being signed.
     """
     return TriageResult(
         conversations=(
@@ -66,7 +69,7 @@ def _sample_result() -> TriageResult:
                 contact_id="c-bianchi",
                 nome="Bianchi",
                 gruppo=Gruppo.IN_CORSO,
-                motivo="aspetta conferma per la dimissione del coniglio",
+                motivo="La signora Bianchi aspetta conferma per la dimissione del coniglio",
                 urgenza=Urgenza.MEDIA,
                 presidio=Presidio.PRESIDIATA,
                 temperatura=Temperatura.BASSA,
@@ -96,7 +99,7 @@ def _sample_result() -> TriageResult:
                 contact_id="c-miri",
                 nome="Miri",
                 gruppo=Gruppo.RUMORE,
-                motivo="conversazione chiusa",
+                motivo="Sig.ra Miri: conversazione chiusa",
                 urgenza=Urgenza.BASSA,
                 presidio=Presidio.PRESIDIATA,
                 temperatura=Temperatura.BASSA,

@@ -16,6 +16,7 @@ from msg_triage.renderers import (
     _memory_clause,
     _one_line,
     _schema_symbols,
+    _strip_leading_name,
     _table_symbols,
     _voice_in_corso_tail,
     _voice_in_corso_waiting,
@@ -659,6 +660,82 @@ def test_voice_number_agreement_never_mismatches():
             ]
             check(_voice_in_corso_waiting(entries), f"waiting n={n} scoperte={scoperte}")
             check(_voice_in_corso_tail(entries), f"tail n={n} scoperte={scoperte}")
+
+
+# --- Il nome del cliente è un campo, non testo ----------------------------------
+#
+# Visto al primo run reale: il modello scrive il nome anche dentro `motivo`, e ogni
+# renderer lo antepone di suo — "Silvia Silvia chiede un appuntamento", "Dati — Sig.
+# Dati: dimissione fissata". Il prompt ora lo vieta, questi test coprono la rete
+# deterministica che chiude il caso quando il modello ci scivola comunque.
+
+
+def test_voice_drops_the_bare_name_the_model_wrote_in_motivo():
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Silvia", motivo="Silvia chiede un appuntamento"))
+    voice = render_voice(r)
+    assert "Silvia chiede un appuntamento." in voice
+    assert voice.count("Silvia") == 1  # una volta sola: il lead-in, non due
+
+
+def test_voice_and_table_drop_name_with_title_and_colon():
+    # "Sig. Dati: dimissione fissata" — nome col titolo davanti e stile etichetta.
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Dati", motivo="Sig. Dati: dimissione fissata"))
+    voice = render_voice(r)
+    assert "Dati dimissione fissata." in voice
+    assert "Sig." not in voice and voice.count("Dati") == 1
+    row = next(l for l in render_table(r).splitlines() if "<b>Dati</b>" in l)
+    assert row.endswith("— dimissione fissata")
+
+
+def test_leading_name_strip_is_case_insensitive_and_title_tolerant():
+    # "Di ruscio" su Callbell, "Di Ruscio" scritto dal modello: il match ignora il case,
+    # e il titolo si tollera da entrambi i lati (anche quando è `nome` a portarlo).
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Di ruscio", motivo="Il signor Di Ruscio — controllo fissato"))
+    assert "Di ruscio controllo fissato." in render_voice(r)
+
+    titled = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Sig.ra Rossi", motivo="la signora Rossi chiede la ricetta"))
+    row = next(l for l in render_table(titled).splitlines() if "Rossi" in l)
+    assert row.endswith("— chiede la ricetta")
+    assert "<b>Sig.ra Rossi</b>" in row  # `nome` resta verbatim: si tocca solo il testo
+
+
+def test_name_that_is_not_at_the_opening_is_left_alone():
+    # Un nome a metà frase è contenuto, non ripetizione; e un nome che è solo la testa
+    # di una parola più lunga (o di un doppio cognome) non è un nome.
+    for nome, motivo in (
+        ("Rossi", "richiamare Rossi domani"),
+        ("Neri", "la **tartaruga** Ruga non mangia"),  # articolo senza titolo: non basta
+        ("Sil", "Silvia chiede un appuntamento"),  # trappola del prefisso
+        ("Tosi", "Tosi-Rossi ha scritto"),
+        ("Rossi", "Rossini ha chiamato"),
+    ):
+        assert _strip_leading_name(motivo, nome) == motivo, (nome, motivo)
+
+
+def test_rumore_still_merges_when_the_model_signs_the_motivo():
+    # Il difetto silenzioso: la chiave di accorpamento È il motivo, quindi un nome dentro
+    # rende ogni chiave unica e l'accorpamento della #12 muore senza farsi vedere.
+    r = _result(
+        _entry(gruppo=Gruppo.RUMORE, nome="Dati", motivo="Sig. Dati: chiedeva gli orari"),
+        _entry(gruppo=Gruppo.RUMORE, nome="Blu", contact_id="c2", motivo="La signora Blu: chiedeva gli orari"),
+    )
+    lines = [l for l in render_schema(r).splitlines() if "chiedeva gli orari" in l]
+    assert lines == [f"{_RUMORE_DOT} <b>Dati</b>, <b>Blu</b>: chiedeva gli orari."]  # una riga, non due
+    assert render_voice(r).count("chiedeva gli orari") == 1
+
+
+def test_text_that_was_only_the_name_degrades_instead_of_emptying_the_row():
+    r = _result(_entry(gruppo=Gruppo.IN_CORSO, nome="Silvia", motivo="Silvia"))
+    assert "Silvia." in render_voice(r)  # il vocale dice il nome e basta
+    row = next(l for l in render_table(r).splitlines() if "<b>Silvia</b>" in l)
+    assert row.endswith("<b>Silvia</b>") and "—" not in row  # riga nuda, nessun trattino orfano
+
+
+def test_empty_nome_leaves_the_text_untouched():
+    # Guardia portante: senza di essa il pattern degenera in "matcha nulla a posizione 0"
+    # e si mangia il separatore in apertura. A livello di render il bug sarebbe invisibile.
+    assert _strip_leading_name(": chiede la ricetta", "") == ": chiede la ricetta"
+    assert _strip_leading_name("chiede la ricetta", "   ") == "chiede la ricetta"
 
 
 # --- Helpers, container, determinism -------------------------------------------
