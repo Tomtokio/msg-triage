@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from msg_triage import telemetry
 from msg_triage.config import ConfigError, load_config, present_keys
 from msg_triage.logging_setup import setup_logging
 
@@ -40,10 +41,14 @@ def main() -> int:
     """Boot the app: load config, then run the Telegram bot (blocking)."""
     _load_dotenv_if_present()
     setup_logging()
+    # After the .env (the library reads TELEMETRY_* from the environment) and after
+    # the logging setup (so its own warnings come out formatted like ours).
+    telemetry.setup()
     try:
         config = load_config()
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
+        telemetry.crashed(exc)
         return 1
 
     logger.info("VetTriage — secrets loaded: %s", ", ".join(present_keys()))
@@ -51,7 +56,15 @@ def main() -> int:
     # only when we actually launch the bot).
     from msg_triage.telegram_bot import run_bot
 
-    run_bot(config)
+    try:
+        run_bot(config)
+    except Exception as exc:  # noqa: BLE001 - report the death, then die as before
+        telemetry.crashed(exc)
+        raise
+    finally:
+        # Clean exit: run_polling() handles SIGINT/SIGTERM and returns, so a
+        # `systemctl restart` gets an agent_stopped. No-op after crashed().
+        telemetry.shutdown()
     return 0
 
 

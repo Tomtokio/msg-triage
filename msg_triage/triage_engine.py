@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from . import telemetry
 from .config import Config
 from .source_adapter import Conversation
 
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-opus-4-8"  # while tuning the prompt; consider Sonnet once stable
 DEFAULT_MAX_TOKENS = 16000  # covers thinking + output, under the non-streaming timeout
 DEFAULT_EFFORT = "high"  # API default; drop to "medium" if runs get slow/costly
+
+# Business label for the one LLM call, in the telemetry usage vocabulary (CLAUDE.md).
+TRIAGE_OPERATION = "conversation_triage"
 
 # The canonical operative prompt lives in the docs (single source of truth).
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "docs" / "triage_system_prompt.md"
@@ -427,6 +431,17 @@ class TriageEngine:
                 "effort": self._effort,
             },
             messages=[{"role": "user", "content": user_message}],
+        )
+
+        # Before validation on purpose: the tokens are spent even when the answer is
+        # a refusal or gets truncated, and that cost has to be recorded anyway.
+        # getattr all the way down: injected fake clients have no usage on their response.
+        api_usage = getattr(response, "usage", None)
+        telemetry.usage(
+            model=self._model,
+            operation=TRIAGE_OPERATION,
+            input_tokens=getattr(api_usage, "input_tokens", None),
+            output_tokens=getattr(api_usage, "output_tokens", None),
         )
 
         self._check_stop_reason(response)

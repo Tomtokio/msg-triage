@@ -68,7 +68,8 @@ La unit di riferimento è versionata in [`deploy/msg-triage.service`](../deploy/
    `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID` (id numerico Telegram),
    `SUPABASE_URL`, `SUPABASE_KEY`. Le ultime due sono richieste **anche se** Supabase non è
    ancora usato: se mancano, l'app non parte — lasciare `unused` finché non si applica la
-   migration (§ E). `LOG_LEVEL` è opzionale (default `INFO`).
+   migration (§ E). Opzionali: `LOG_LEVEL` (default `INFO`) e le tre `TELEMETRY_*` (§ F);
+   se le `TELEMETRY_*` mancano, la telemetria è semplicemente spenta e il bot parte uguale.
 
 5. **Smoke test in foreground** (ancora come `msgtriage`, prima di installare il servizio):
    ```
@@ -111,6 +112,9 @@ sudo systemctl restart msg-triage           # OBBLIGATORIO dopo modifiche a .env
 sudo systemctl status msg-triage
 sudo journalctl -u msg-triage -n 50
 ```
+
+> `vet_agents_telemetry` **non** è in `pyproject.toml` (è pinnata a un tag, § F): quindi
+> `uv pip install -e .` non la aggiorna. Per cambiarne versione serve il comando esplicito.
 
 ---
 
@@ -245,6 +249,95 @@ riecheggerebbero la riga rifiutata, cioè nomi di clienti, dentro il journal.
 Non attiva: lo snippet è in fondo al file della migration, commentato. Consigliata —
 90 giorni per `triage_runs` (`conversation_states` cade a cascata), 12 mesi per le tabelle
 di T10. Da lanciare a mano quando serve.
+
+---
+
+## F. Telemetria — installare la libreria e accendere il monitoraggio
+
+Una tantum. Serve a far vedere l'agente sulla dashboard degli agenti: che il processo è
+vivo (heartbeat ogni 5 minuti), com'è andato ogni run di triage e quanto è costata la
+chiamata a Claude. Finché non si fanno questi passi il bot funziona **identico**: la
+libreria è fail-silent per contratto, e il codice la importa in modo protetto.
+
+Libreria: **`vet_agents_telemetry` v0.1.1**. Contratto:
+[`docs/telemetry_api_contract.md`](telemetry_api_contract.md).
+Progetto Supabase: lo stesso di § E (`agents-telemetry`), schema **`telemetry`** — diverso
+da `msg_triage`, tabelle diverse, chiave letta da variabili sue. La libreria **non** riusa
+`SUPABASE_URL`/`SUPABASE_KEY`.
+
+1. **Installazione, pinnata al tag.** Come `msgtriage`, dentro il venv del repo:
+   ```
+   sudo -u msgtriage -i
+   cd ~/msg-triage
+   uv pip install git+ssh://git@github.com/Tomtokio/vet-agents-telemetry.git@v0.1.1
+   ```
+   Non va in `pyproject.toml` apposta: la versione la si sceglie a mano, un tag alla volta.
+
+   > **Accesso SSH.** `msgtriage` ha una deploy key dedicata anche su
+   > `vet-agents-telemetry`: quella di `msg-triage` è scoped su quel repo e non basta.
+   > Se in `~/.ssh/config` la seconda key sta dietro un alias, l'URL dell'install deve
+   > usare l'alias al posto di `github.com`. Sintomo se qualcosa non torna:
+   > `Permission denied (publickey)` durante l'install.
+
+   **Controllare cosa è stato davvero installato** — un tag può puntare al commit
+   sbagliato, e il sintomo (costi tutti a zero) si vede solo settimane dopo:
+   ```
+   .venv/bin/python -c "import vet_agents_telemetry as t; from vet_agents_telemetry \
+   import pricing; print(t.__version__, pricing.compute_cost('anthropic', \
+   'claude-opus-4-8', input_tokens=1000000, output_tokens=1000000))"
+   ```
+   Atteso: `0.1.1 30.0`. Se stampa `0.1.0` o `None`, il modello non è nella pricing
+   table: la telemetria funziona lo stesso, i token sono giusti, ma ogni riga di
+   `agent_usage` avrà `cost_usd = 0` e comparirà un evento `pricing_missing`.
+
+2. **`.env` sul VPS.** Come `msgtriage` (`~/msg-triage/.env`, permessi 0600):
+   ```
+   TELEMETRY_SUPABASE_URL=https://hmbyxyyckvfbbfcjyhad.supabase.co
+   TELEMETRY_SUPABASE_KEY=eyJh…      # service_role dedicata agli agenti
+   TELEMETRY_ENABLED=true            # opzionale: è già il default
+   ```
+   Poi, dall'account con sudo: `sudo systemctl restart msg-triage`.
+
+3. **Verifica.** All'avvio, senza fare niente su Telegram:
+   ```sql
+   select type, severity, metadata, created_at from telemetry.agent_events
+   where agent_id = 'msg-triage' order by created_at desc limit 5;
+
+   select status, updated_at from telemetry.agent_heartbeats where agent_id = 'msg-triage';
+   ```
+   Attesi un `agent_started` e un heartbeat `ok`. Poi `/triage` da Telegram: quattro eventi
+   con lo **stesso `job_id`** (`processing_started` → `conversations_fetched` →
+   `triage_judged` → `processing_completed`) e una riga di costo:
+   ```sql
+   select model, operation, input_tokens, output_tokens, cost_usd
+   from telemetry.agent_usage where agent_id = 'msg-triage'
+   order by created_at desc limit 1;
+   ```
+
+4. **Spegnerla.** `TELEMETRY_ENABLED=false` in `.env` + restart: no-op completo, nessun
+   log, nessuna rete. Non serve disinstallare niente.
+
+### Se qualcosa non va
+
+Il triage arriva **comunque** su Telegram, sempre: nessuna chiamata di telemetria può far
+fallire o rallentare un run. I problemi si vedono solo nel journal, sotto il logger
+`vet_agents_telemetry`:
+
+```
+sudo journalctl -u msg-triage -n 100 | grep -i telemetry
+```
+
+| Nel log | Cosa succede |
+|---|---|
+| `vet_agents_telemetry non installata: telemetria non attiva` | passo 1 non fatto (o venv sbagliato) |
+| `Telemetry disabled: TELEMETRY_SUPABASE_URL / …_KEY not set` | passo 2 non fatto |
+| `auth failure (status 401/403)` | chiave sbagliata o revocata |
+| `timed out (>3.0s)` / `Supabase unreachable` | rete del VPS; l'evento è perso, nient'altro |
+| nessuna riga | tutto a posto, oppure `TELEMETRY_ENABLED=false` |
+
+**Cosa NON finisce nella telemetria:** nomi di clienti, numeri di telefono, testo dei
+messaggi, testo del digest, prompt e risposte del modello. Solo id di riferimento,
+conteggi, durate e codici di errore — vedi `CLAUDE.md § Telemetria`.
 
 ---
 

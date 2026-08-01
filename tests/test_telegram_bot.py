@@ -285,7 +285,9 @@ def _record_saves(monkeypatch, message) -> list[dict]:
 def test_triage_command_handles_empty_window(monkeypatch):
     empty = _result()
     monkeypatch.setattr(
-        telegram_bot, "run_triage_pipeline", lambda config, hours: (empty, render_all(empty), [])
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (empty, render_all(empty), []),
     )
     message = _FakeMessage()
     saves = _record_saves(monkeypatch, message)
@@ -303,7 +305,9 @@ def test_triage_command_delivers_three_formats(monkeypatch):
     result = _result(_triage_entry())
     rendered = render_all(result)
     monkeypatch.setattr(
-        telegram_bot, "run_triage_pipeline", lambda config, hours: (result, rendered, ["conv"])
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (result, rendered, ["conv"]),
     )
     message = _FakeMessage()
     _record_saves(monkeypatch, message)
@@ -323,7 +327,9 @@ def test_triage_command_saves_the_run_after_delivering_it(monkeypatch):
     result = _result(_triage_entry())
     rendered = render_all(result)
     monkeypatch.setattr(
-        telegram_bot, "run_triage_pipeline", lambda config, hours: (result, rendered, ["conv"])
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (result, rendered, ["conv"]),
     )
     message = _FakeMessage()
     saves = _record_saves(monkeypatch, message)
@@ -342,7 +348,7 @@ def test_triage_command_saves_the_run_after_delivering_it(monkeypatch):
 
 
 def test_triage_command_reports_pipeline_error(monkeypatch):
-    def boom(config, hours):
+    def boom(config, hours, *, job_id=None):
         raise TriageError("il modello ha rifiutato la richiesta")
 
     monkeypatch.setattr(telegram_bot, "run_triage_pipeline", boom)
@@ -353,6 +359,105 @@ def test_triage_command_reports_pipeline_error(monkeypatch):
 
     assert any("Errore durante il triage" in reply for reply in message.replies)
     assert any("ha rifiutato" in reply for reply in message.replies)
+
+
+# --- Telemetry on the run lifecycle ---------------------------------------------
+
+
+class _TelemetrySpy:
+    """Stands in for the telemetry wrapper and records what a run emits, in order."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def event(self, type, *, severity="info", message=None, metadata=None) -> None:
+        self.events.append((type, metadata or {}))
+
+    async def aevent(self, type, *, severity="info", message=None, metadata=None) -> None:
+        self.event(type, severity=severity, message=message, metadata=metadata)
+
+    def types(self) -> list[str]:
+        return [type for type, _ in self.events]
+
+
+def _spy_telemetry(monkeypatch) -> _TelemetrySpy:
+    spy = _TelemetrySpy()
+    monkeypatch.setattr(telegram_bot, "telemetry", spy)
+    return spy
+
+
+def test_telemetry_pairs_started_with_completed(monkeypatch):
+    result = _result(_triage_entry())
+    rendered = render_all(result)
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (result, rendered, ["conv"]),
+    )
+    spy = _spy_telemetry(monkeypatch)
+    message = _FakeMessage()
+    _record_saves(monkeypatch, message)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=["12"])
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert spy.types() == ["processing_started", "processing_completed"]
+    started, completed = spy.events
+    assert started[1]["window_hours"] == 12.0
+    assert completed[1]["job_id"] == started[1]["job_id"]  # one job, one id
+    assert completed[1]["delivered"] is True
+
+
+def test_telemetry_closes_an_empty_window_as_completed(monkeypatch):
+    """Nothing to report is a successful run, not a failure: the pair stays intact."""
+    empty = _result()
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (empty, render_all(empty), []),
+    )
+    spy = _spy_telemetry(monkeypatch)
+    message = _FakeMessage()
+    _record_saves(monkeypatch, message)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert spy.types() == ["processing_started", "processing_completed"]
+    assert spy.events[1][1]["delivered"] is False
+    assert spy.events[1][1]["n_triaged"] == 0
+
+
+def test_telemetry_reports_a_failure_without_the_exception_message(monkeypatch):
+    secret = "la sig.ra Rossi con il pappagallo"
+
+    def boom(config, hours, *, job_id=None):
+        raise TriageError(secret)
+
+    monkeypatch.setattr(telegram_bot, "run_triage_pipeline", boom)
+    spy = _spy_telemetry(monkeypatch)
+    message = _FakeMessage()
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert spy.types() == ["processing_started", "processing_failed"]
+    metadata = spy.events[1][1]
+    assert metadata["reason"] == "triage_error"
+    assert metadata["exception"] == "TriageError"
+    # Privacy: only class name and a fixed code travel; the text stays in the log.
+    assert secret not in str(metadata)
+
+
+def test_telemetry_gates_run_before_the_deterministic_checks(monkeypatch):
+    """A rejected argument is not a run: no started event to leave dangling."""
+    spy = _spy_telemetry(monkeypatch)
+    message = _FakeMessage()
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=["-3"])
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert spy.events == []
 
 
 # --- build_bot (whitelist wiring) ----------------------------------------------

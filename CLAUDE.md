@@ -10,6 +10,7 @@ Legge i messaggi recenti, li giudica, produce un digest a tre livelli.
 - `docs/tasks.md` — task T1–T9, ordine e dipendenze
 - `docs/dev_notes.md` — convenzioni, vincoli, anti-pattern
 - `docs/triage_system_prompt.md` — il system prompt del triage (testo operativo)
+- `docs/telemetry_api_contract.md` — contratto della libreria `vet_agents_telemetry`
 
 ## Protocollo di lavoro (due pause)
 1. **Prima di scrivere codice**: proponi un piano e aspetta approvazione esplicita.
@@ -39,6 +40,40 @@ Non saltare queste pause. Mai.
   `uv venv --python 3.12` poi `uv pip install -e ".[dev]"`
 - Test: `.venv/bin/python -m pytest`
 - Deploy target: VPS `vps-agenti` (systemd). Il deploy lo fa Tommaso.
+
+## Telemetria (`vet_agents_telemetry` v0.1.1)
+Un solo punto di import: **`msg_triage/telemetry.py`**. Nessun altro modulo importa la
+libreria. Il wrapper è fail-silent e con import protetto: se la libreria non è installata
+(non è in `pyproject.toml`, si pinna a un tag — vedi `docs/runbook.md § F`) tutto è no-op.
+
+- **`tenant_id` = `"self"` sempre**, eventi di business inclusi. È lo strumento personale
+  di Tommaso, non un servizio consegnato a un cliente: non c'è un tenant a cui attribuire
+  niente. Diverso dagli altri agenti dell'ecosistema — non copiarli su questo punto.
+- **`telemetry.setup()` va dopo il caricamento del `.env`**, altrimenti la libreria non
+  trova le sue variabili. Le tre `TELEMETRY_*` sono sue: non riusa `SUPABASE_URL/KEY`.
+- In contesto async si usa `await telemetry.aevent(...)`: la scrittura è HTTP bloccante
+  (timeout 3 s) e bloccherebbe l'event loop. Nel worker thread va bene `telemetry.event(...)`.
+
+**Eventi.** Standard: `agent_started` (dalla libreria), `agent_stopped`, `agent_crashed`,
+`processing_started`, `processing_completed`, `processing_failed` — la coppia
+started/completed|failed copre **ogni** run, finestra vuota inclusa (è un run riuscito che
+non aveva niente da dire). Custom di questo agente: `conversations_fetched`,
+`triage_judged`, `bot_error`.
+
+**`operation` per `log_usage`:** `conversation_triage` (l'unica chiamata LLM del run).
+Provider `anthropic`, `cost_usd` **non** passato: lo calcola la pricing table.
+
+**Metadata — solo questi:** `job_id`, `window_hours`, `n_conversations`, `n_triaged`,
+`duration_ms`, `delivered`, `reason`, `exception`. **Mai** nomi di clienti, `contact_id`,
+numeri di telefono, testo dei messaggi, testo del digest, prompt o risposte del modello.
+Sui fallimenti viaggiano il **nome della classe** dell'eccezione e un `reason` snake_case
+fisso (`callbell_error`, `triage_error`, `unexpected_error`, `delivery_failed`), mai il
+messaggio: quello resta su journald.
+
+**Frequenza.** 4 eventi + 1 riga usage per `/triage`, che è manuale. Non aggiungere eventi
+nei punti caldi: `_window_messages` (per messaggio), `CallbellClient._get`/`_paginate`
+(per pagina HTTP), i loop per-entry dei renderer. E non aggiungere un handler catch-all al
+bot per intercettare il polling: romperebbe il silenzio verso gli utenti non autorizzati.
 
 ## Fatti Callbell verificati sul dato reale (2026-07-16)
 1. Paginazione: envelope `meta: {page, pages}` — iterare finché `page < pages` (NON `data["pagination"]["nextPage"]`).
