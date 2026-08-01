@@ -20,6 +20,12 @@ uv pip install -e ".[dev]"
 cp .env.example .env   # poi compila i valori
 ```
 
+Opzionale — telemetria (libreria pinnata a un tag, fuori da `pyproject.toml`; senza,
+l'app funziona identica e la telemetria resta spenta). Dettagli in `docs/runbook.md § F`:
+```bash
+uv pip install git+ssh://git@github.com/Tomtokio/vet-agents-telemetry.git@v0.1.1
+```
+
 ## Avvio
 ```bash
 python -m msg_triage      # oppure: msg-triage

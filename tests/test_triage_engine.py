@@ -10,9 +10,12 @@ from datetime import datetime, timezone
 
 import pytest
 
+from msg_triage import triage_engine
 from msg_triage.config import Config
 from msg_triage.source_adapter import Conversation, Message, Role
 from msg_triage.triage_engine import (
+    DEFAULT_MODEL,
+    TRIAGE_OPERATION,
     TRIAGE_SYSTEM,
     Gruppo,
     Presidio,
@@ -274,6 +277,71 @@ def test_triage_raises_on_invalid_json():
 
     with pytest.raises(TriageError, match="valid JSON"):
         engine.triage([_conv("c1")])
+
+
+# --- Telemetry: token usage of the one LLM call --------------------------------
+
+
+class FakeUsage:
+    def __init__(self, input_tokens: int, output_tokens: int):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class UsageSpy:
+    """Stands in for the telemetry wrapper and records the usage calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def usage(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+
+
+def _spy_usage(monkeypatch) -> UsageSpy:
+    spy = UsageSpy()
+    monkeypatch.setattr(triage_engine, "telemetry", spy)
+    return spy
+
+
+def test_triage_records_token_usage(monkeypatch):
+    client = _fake_client_returning({"conversazioni": [_entry(1)]})
+    client.messages._responses[0].usage = FakeUsage(1200, 340)
+    spy = _spy_usage(monkeypatch)
+    engine = TriageEngine(client, now=_fixed_now)
+
+    engine.triage([_conv("c1")])
+
+    assert spy.calls == [
+        {
+            "model": DEFAULT_MODEL,
+            "operation": TRIAGE_OPERATION,
+            "input_tokens": 1200,
+            "output_tokens": 340,
+        }
+    ]
+
+
+def test_triage_records_usage_even_when_the_answer_is_refused(monkeypatch):
+    """The tokens are spent before we look at stop_reason: the cost is real."""
+    refused = FakeMessage([], stop_reason="refusal")
+    refused.usage = FakeUsage(900, 12)
+    spy = _spy_usage(monkeypatch)
+    engine = TriageEngine(FakeClient([refused]), now=_fixed_now)
+
+    with pytest.raises(TriageError):
+        engine.triage([_conv("c1")])
+
+    assert spy.calls[0]["input_tokens"] == 900
+
+
+def test_triage_records_no_usage_without_an_api_call(monkeypatch):
+    spy = _spy_usage(monkeypatch)
+    engine = TriageEngine(FakeClient([]), now=_fixed_now)
+
+    engine.triage([])  # empty input short-circuits before the API
+
+    assert spy.calls == []
 
 
 # --- Response parsing: completeness and robustness -----------------------------

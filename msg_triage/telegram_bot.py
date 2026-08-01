@@ -29,8 +29,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
+import uuid
 from typing import TYPE_CHECKING
 
+from msg_triage import telemetry
 from msg_triage.callbell_adapter import CallbellError, build_adapter
 from msg_triage.config import Config
 from msg_triage.renderers import RenderedTriage, render_all
@@ -137,12 +140,18 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+def _elapsed_ms(since: float) -> int:
+    """Milliseconds since a ``time.monotonic()`` mark (telemetry durations)."""
+    return int((time.monotonic() - since) * 1000)
+
+
 def run_triage_pipeline(
     config: Config,
     hours: float,
     *,
     adapter=None,
     engine=None,
+    job_id: str | None = None,
 ) -> tuple[TriageResult, RenderedTriage, list[Conversation]]:
     """Run the synchronous T2 -> T3 -> T5 pipeline; return result, rendering, source.
 
@@ -154,11 +163,36 @@ def run_triage_pipeline(
     The neutral conversations come back too because persistence needs
     ``last_message_at``, which lives on the source conversation and not on the triage
     judgment. They stay in the neutral format, so nothing Callbell-specific travels.
+
+    ``job_id`` only labels the two telemetry events emitted at the internal stage
+    boundaries: the caller sees a single thread hop and could not place them itself.
+    Telemetry is synchronous here because this function already runs off the event loop.
     """
     adapter = adapter if adapter is not None else build_adapter(config)
+    fetch_started = time.monotonic()
     conversations = adapter.fetch_recent_conversations(window_hours=hours)
+    telemetry.event(
+        "conversations_fetched",
+        metadata={
+            "job_id": job_id,
+            "n_conversations": len(conversations),
+            "duration_ms": _elapsed_ms(fetch_started),
+        },
+    )
+
     engine = engine if engine is not None else build_triage_engine(config)
+    judge_started = time.monotonic()
     result = engine.triage(conversations)  # SEAM T4: previous_state intentionally omitted
+    telemetry.event(
+        "triage_judged",
+        metadata={
+            "job_id": job_id,
+            "n_conversations": len(conversations),
+            "n_triaged": len(result.conversations),
+            "duration_ms": _elapsed_ms(judge_started),
+        },
+    )
+
     rendered = render_all(result)
     return result, rendered, conversations
 
@@ -195,6 +229,36 @@ async def _deliver_triage(message, rendered: RenderedTriage) -> None:
     await _send(message, f"🔊 VOCALE\n\n{rendered.vocal_text}")
 
 
+async def _failed(
+    job_id: str, started: float, exc: BaseException, *, reason: str | None = None
+) -> None:
+    """Close a run as failed in the telemetry.
+
+    The exception MESSAGE never travels: only its class name and a fixed snake_case
+    code. Callbell/triage errors are ours and look harmless today, but the readable
+    text belongs in journald (where it already goes), not in a dashboard nobody
+    filters — same stance as ``storage._error_detail``, which drops the PostgREST
+    details because they echo the offending row.
+    """
+    if reason is None:
+        if isinstance(exc, CallbellError):
+            reason = "callbell_error"
+        elif isinstance(exc, TriageError):
+            reason = "triage_error"
+        else:
+            reason = "unexpected_error"
+    await telemetry.aevent(
+        "processing_failed",
+        severity="error",
+        metadata={
+            "job_id": job_id,
+            "reason": reason,
+            "exception": type(exc).__name__,
+            "duration_ms": _elapsed_ms(started),
+        },
+    )
+
+
 async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle ``/triage [ore]``: fetch, triage, render, deliver the three formats.
 
@@ -222,22 +286,34 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     async with lock:
         label = _hours_label(hours)
+        # After the deterministic gates: every processing_started gets its closing
+        # event. Telemetry-only id, unrelated to the triage_runs row (which exists
+        # only for successful non-empty runs, i.e. the cases needing no debugging).
+        job_id = f"msg-triage-{uuid.uuid4().hex[:8]}"
+        run_started = time.monotonic()
+        # Telemetry always follows the user-facing message, never precedes it: like
+        # persistence, it must not sit in the critical path, not even as latency.
         await message.reply_text(
             f"🔍 Recupero le conversazioni delle ultime {label} e le analizzo…"
         )
+        await telemetry.aevent(
+            "processing_started", metadata={"job_id": job_id, "window_hours": hours}
+        )
         try:
             result, rendered, conversations = await asyncio.to_thread(
-                run_triage_pipeline, config, hours
+                run_triage_pipeline, config, hours, job_id=job_id
             )
         except (CallbellError, TriageError) as exc:
             logger.warning("Triage fallito: %s", exc)
             await message.reply_text(f"⚠️ Errore durante il triage: {exc}")
+            await _failed(job_id, run_started, exc)
             return
-        except Exception:  # noqa: BLE001 - last resort; the user must not be left hanging
+        except Exception as exc:  # noqa: BLE001 - last resort; the user must not be left hanging
             logger.exception("Errore imprevisto durante il triage")
             await message.reply_text(
                 "⚠️ Errore imprevisto durante il triage. Controlla i log."
             )
+            await _failed(job_id, run_started, exc)
             return
 
         if not result.conversations:
@@ -245,9 +321,36 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(
                 f"✅ Nessuna conversazione con attività nelle ultime {label}."
             )
+            # Still a completed run, not a failure: nothing happened, and saying so
+            # is the correct outcome. Keeps every started/completed pair intact.
+            await telemetry.aevent(
+                "processing_completed",
+                metadata={
+                    "job_id": job_id,
+                    "n_conversations": len(conversations),
+                    "n_triaged": 0,
+                    "delivered": False,
+                    "duration_ms": _elapsed_ms(run_started),
+                },
+            )
             return
 
-        await _deliver_triage(message, rendered)
+        try:
+            await _deliver_triage(message, rendered)
+        except Exception as exc:  # noqa: BLE001 - report, then fail exactly as before
+            await _failed(job_id, run_started, exc, reason="delivery_failed")
+            raise
+
+        await telemetry.aevent(
+            "processing_completed",
+            metadata={
+                "job_id": job_id,
+                "n_conversations": len(conversations),
+                "n_triaged": len(result.conversations),
+                "delivered": True,
+                "duration_ms": _elapsed_ms(run_started),
+            },
+        )
 
         # T7: best-effort, after delivery, off the event loop. Cannot raise.
         await asyncio.to_thread(
@@ -280,6 +383,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:  # noqa: BLE001 - best-effort notification only
             logger.exception("Invio della notifica di errore fallito")
+
+    # Rare by construction (triage_command catches its own), so no volume risk.
+    await telemetry.aevent(
+        "bot_error",
+        severity="error",
+        metadata={"exception": type(context.error).__name__},
+    )
 
 
 # --- Wiring (telegram imported lazily) -----------------------------------------
