@@ -11,6 +11,7 @@ Callbell/Anthropic call happens).
 from __future__ import annotations
 
 import asyncio
+from typing import NamedTuple
 
 import pytest
 
@@ -111,6 +112,13 @@ class _FakeContext:
     def __init__(self, *, config, lock, args):
         self.bot_data = {"config": config, "triage_lock": lock}
         self.args = args
+
+
+class _FakeErrorContext:
+    """Only what ``on_error`` touches: the exception that reached the handler."""
+
+    def __init__(self, error: BaseException):
+        self.error = error
 
 
 # --- parse_window_hours --------------------------------------------------------
@@ -364,20 +372,30 @@ def test_triage_command_reports_pipeline_error(monkeypatch):
 # --- Telemetry on the run lifecycle ---------------------------------------------
 
 
+class _Event(NamedTuple):
+    """One emission. Severity included: it is the contract with the dashboard (it
+    decides the colour of the light), so a spy that drops it would leave the whole
+    classification untested."""
+
+    type: str
+    severity: str
+    metadata: dict
+
+
 class _TelemetrySpy:
     """Stands in for the telemetry wrapper and records what a run emits, in order."""
 
     def __init__(self) -> None:
-        self.events: list[tuple[str, dict]] = []
+        self.events: list[_Event] = []
 
     def event(self, type, *, severity="info", message=None, metadata=None) -> None:
-        self.events.append((type, metadata or {}))
+        self.events.append(_Event(type, severity, metadata or {}))
 
     async def aevent(self, type, *, severity="info", message=None, metadata=None) -> None:
         self.event(type, severity=severity, message=message, metadata=metadata)
 
     def types(self) -> list[str]:
-        return [type for type, _ in self.events]
+        return [event.type for event in self.events]
 
 
 def _spy_telemetry(monkeypatch) -> _TelemetrySpy:
@@ -403,9 +421,10 @@ def test_telemetry_pairs_started_with_completed(monkeypatch):
 
     assert spy.types() == ["processing_started", "processing_completed"]
     started, completed = spy.events
-    assert started[1]["window_hours"] == 12.0
-    assert completed[1]["job_id"] == started[1]["job_id"]  # one job, one id
-    assert completed[1]["delivered"] is True
+    assert [event.severity for event in spy.events] == ["info", "info"]
+    assert started.metadata["window_hours"] == 12.0
+    assert completed.metadata["job_id"] == started.metadata["job_id"]  # one job, one id
+    assert completed.metadata["delivered"] is True
 
 
 def test_telemetry_closes_an_empty_window_as_completed(monkeypatch):
@@ -424,8 +443,9 @@ def test_telemetry_closes_an_empty_window_as_completed(monkeypatch):
     asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
 
     assert spy.types() == ["processing_started", "processing_completed"]
-    assert spy.events[1][1]["delivered"] is False
-    assert spy.events[1][1]["n_triaged"] == 0
+    assert spy.events[1].severity == "info"  # nothing to report is not an anomaly
+    assert spy.events[1].metadata["delivered"] is False
+    assert spy.events[1].metadata["n_triaged"] == 0
 
 
 def test_telemetry_reports_a_failure_without_the_exception_message(monkeypatch):
@@ -442,7 +462,11 @@ def test_telemetry_reports_a_failure_without_the_exception_message(monkeypatch):
     asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
 
     assert spy.types() == ["processing_started", "processing_failed"]
-    metadata = spy.events[1][1]
+    failed = spy.events[1]
+    # The run failed and the digest never arrived: nothing healed here, so it is the
+    # one outcome that must ask for attention. Contrast bot_error, which is a warning.
+    assert failed.severity == "error"
+    metadata = failed.metadata
     assert metadata["reason"] == "triage_error"
     assert metadata["exception"] == "TriageError"
     # Privacy: only class name and a fixed code travel; the text stays in the log.
@@ -458,6 +482,27 @@ def test_telemetry_gates_run_before_the_deterministic_checks(monkeypatch):
     asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
 
     assert spy.events == []
+
+
+def test_bot_error_is_a_warning_not_an_error(monkeypatch):
+    """on_error is also where the long polling drops its failures, and PTB recovers.
+
+    NetworkError towards the Telegram API is the typical case: transient, healed by
+    the next retry, and with ``update=None`` (no chat to answer). Classifying it
+    `error` would leave a red light in the dashboard for 24h over a problem that no
+    longer exists.
+    """
+    from telegram.error import NetworkError
+
+    spy = _spy_telemetry(monkeypatch)
+    context = _FakeErrorContext(NetworkError("Bad Gateway"))
+
+    asyncio.run(telegram_bot.on_error(None, context))
+
+    assert spy.types() == ["bot_error"]
+    assert spy.events[0].severity == "warning"
+    # Only the class name travels, as everywhere else in this agent.
+    assert spy.events[0].metadata == {"exception": "NetworkError"}
 
 
 # --- build_bot (whitelist wiring) ----------------------------------------------

@@ -60,6 +60,14 @@ started/completed|failed copre **ogni** run, finestra vuota inclusa (è un run r
 non aveva niente da dire). Custom di questo agente: `conversations_fetched`,
 `triage_judged`, `bot_error`.
 
+**Severity.** `error` = richiede attenzione, `warning` = anomalia già rientrata. Emettono
+`error` **soltanto** `processing_failed` (il run è fallito, il digest non è arrivato) e
+`agent_crashed` (il processo è morto e resta giù finché non interviene qualcuno). Tutto il
+resto è `info`. `bot_error` è **`warning`**, non `error`: `on_error` è anche il sink dei
+fallimenti del long polling (`NetworkError`, 409 Conflict, `RetryAfter`, con `update=None`),
+da cui python-telegram-bot si riprende da solo — classificarlo `error` accende un rosso per
+24 h in dashboard su un guasto che non esiste più.
+
 **`operation` per `log_usage`:** `conversation_triage` (l'unica chiamata LLM del run).
 Provider `anthropic`, `cost_usd` **non** passato: lo calcola la pricing table.
 
