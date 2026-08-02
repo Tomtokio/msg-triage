@@ -384,10 +384,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:  # noqa: BLE001 - best-effort notification only
             logger.exception("Invio della notifica di errore fallito")
 
-    # Rare by construction (triage_command catches its own), so no volume risk.
+    # warning, not error: this handler is also where the long polling drops its own
+    # failures (NetworkError, 409 Conflict, RetryAfter — with update=None), and PTB
+    # retries out of them by itself. An `error` would light the dashboard red for 24h
+    # over a fault that already healed. A triage that really failed asks for attention
+    # through its own processing_failed, which stays `error`.
     await telemetry.aevent(
         "bot_error",
-        severity="error",
+        severity="warning",
         metadata={"exception": type(context.error).__name__},
     )
 
