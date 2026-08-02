@@ -70,6 +70,10 @@ La unit di riferimento è versionata in [`deploy/msg-triage.service`](../deploy/
    ancora usato: se mancano, l'app non parte — lasciare `unused` finché non si applica la
    migration (§ E). Opzionali: `LOG_LEVEL` (default `INFO`) e le tre `TELEMETRY_*` (§ F);
    se le `TELEMETRY_*` mancano, la telemetria è semplicemente spenta e il bot parte uguale.
+   > `LOG_LEVEL=DEBUG` **non** fa ricomparire le righe `HTTP Request` di `httpx`: quel
+   > logger è fisso a WARNING perché l'URL di `getUpdates` contiene il token del bot in
+   > chiaro. Non si perde niente di utile — Callbell e Supabase passano da `requests` e
+   > non erano comunque visibili a INFO.
 
 5. **Smoke test in foreground** (ancora come `msgtriage`, prima di installare il servizio):
    ```
