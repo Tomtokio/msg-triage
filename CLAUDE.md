@@ -3,7 +3,9 @@
 ## Cos'è questo progetto
 Triage intelligente delle conversazioni WhatsApp della clinica (via Callbell).
 Legge i messaggi recenti, li giudica, produce un digest a tre livelli.
-**Legge soltanto: non risponde mai ai clienti.**
+**Non risponde mai ai clienti.** Il triage è sola lettura; l'unica scrittura che il progetto
+si concede è sui *tag* dei contatti (pulizia una tantum, poi T10). Mai un messaggio, mai
+niente che il cliente possa vedere.
 
 ## Documentazione — LEGGILA PRIMA DI QUALSIASI COSA
 - `docs/project_state.md` — cos'è, obiettivi, decisioni prese
@@ -81,4 +83,14 @@ bot per intercettare il polling: romperebbe il silenzio verso gli utenti non aut
 3. Telefono del contatto = `phoneNumber`; `assignedUser` (email o null) = segnale PRESIDIO nel formato neutro.
 4. Note di sistema (`status` note, senza `uuid`, `from == to`) distinte dalle note scritte dalle colleghe.
 5. `/contacts` ~332 pagine, ordinato per attività: la finestra temporale è il filtro primario, non paginare tutto.
+Vedi `docs/dev_notes.md` per il dettaglio.
+
+## Fatti Callbell sulla SCRITTURA, verificati sul dato reale (2026-08-01)
+1. `PATCH /contacts/:uuid` con `{"tags": [...]}` è **REPLACE**: la lista è un insieme assoluto, non un delta. Per rimuovere si rimandano tutti gli altri tag.
+2. `{"tags": []}` viene salvato davvero: nessun no-op silenzioso sulla lista vuota.
+3. Un body PATCH parziale **non** azzera i collaterali (`name`, `note`, `assignedUser`, `customFields`).
+4. I nomi dei tag sopravvivono **byte per byte, spazio finale incluso**.
+5. **`GET /contacts/:uuid` → `{"contact": {...}}`, un OGGETTO — la doc dice array di un elemento ed è sbagliata** (`json["contact"][0]` → `KeyError`).
+6. Il filtro `?tags[]=` è case-insensitive: serve a trovare i candidati, mai a stabilire cosa un contatto porti. Ricontrollo esatto lato client, senza `strip()` né `lower()`.
+7. `CallbellClient` è read-only salvo `allow_writes=True`, che `build_adapter()` non passa: il bot **non può** scrivere. Unica scrittura esposta: `update_contact_tags()`.
 Vedi `docs/dev_notes.md` per il dettaglio.

@@ -68,8 +68,16 @@ class FakeSession:
         self._responses = list(responses)
         self.calls = []
 
-    def get(self, url, headers=None, params=None):
-        self.calls.append({"url": url, "headers": headers, "params": params})
+    def request(self, method, url, headers=None, params=None, json=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "json": json,
+            }
+        )
         return self._responses.pop(0)
 
 
@@ -168,6 +176,7 @@ def test_client_paginates_until_last_page_and_sends_auth_and_page_params():
 
     assert [c["uuid"] for c in contacts] == ["a", "b"]
     assert len(session.calls) == 2
+    assert session.calls[0]["method"] == "GET"
     assert session.calls[0]["headers"] == {"Authorization": "Bearer key"}
     assert session.calls[0]["params"] == {"page": 1}
     assert session.calls[1]["params"] == {"page": 2}
@@ -197,6 +206,94 @@ def test_client_raises_on_http_error():
 
     with pytest.raises(CallbellError):
         list(client.iter_contacts())
+
+
+def test_paginate_carries_extra_params_alongside_page():
+    session = FakeSession(
+        [
+            FakeResponse({"contacts": [{"uuid": "a"}], "meta": {"page": 1, "pages": 2}}),
+            FakeResponse({"contacts": [{"uuid": "b"}], "meta": {"page": 2, "pages": 2}}),
+        ]
+    )
+    client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
+
+    contacts = list(client.iter_contacts_by_tag("Tommaso rispondi! "))
+
+    assert [c["uuid"] for c in contacts] == ["a", "b"]
+    assert session.calls[0]["params"] == {"tags[]": "Tommaso rispondi! ", "page": 1}
+    assert session.calls[1]["params"] == {"tags[]": "Tommaso rispondi! ", "page": 2}
+
+
+# --- HTTP client: the write path -----------------------------------------------
+
+
+def test_get_contact_unwraps_the_object_envelope():
+    session = FakeSession([FakeResponse({"contact": {"uuid": "c1", "tags": ["Risolto"]}})])
+    client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
+
+    contact = client.get_contact("c1")
+
+    assert contact == {"uuid": "c1", "tags": ["Risolto"]}
+    assert session.calls[0]["method"] == "GET"
+    assert session.calls[0]["url"].endswith("/contacts/c1")
+
+
+def test_get_contact_rejects_an_unexpected_envelope():
+    """The docs claim {"contact": [ {...} ]}; real data is an object (2026-08-01).
+
+    We do not accept both shapes: a change must fail by name, not as a KeyError
+    somewhere inside a write loop.
+    """
+    session = FakeSession([FakeResponse({"contact": [{"uuid": "c1"}]})])
+    client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
+
+    with pytest.raises(CallbellError):
+        client.get_contact("c1")
+
+
+def test_update_contact_tags_patches_the_whole_list():
+    session = FakeSession([FakeResponse({"contact": {"uuid": "c1", "tags": ["Risolto"]}})])
+    client = CallbellClient(
+        "key", session=session, sleep=lambda s: None, throttle=0, allow_writes=True
+    )
+
+    saved = client.update_contact_tags("c1", ["Risolto"])
+
+    assert saved["tags"] == ["Risolto"]
+    call = session.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"].endswith("/contacts/c1")
+    assert call["json"] == {"tags": ["Risolto"]}
+
+
+def test_write_is_refused_on_a_read_only_client():
+    session = FakeSession([])
+    client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
+
+    with pytest.raises(CallbellError):
+        client.update_contact_tags("c1", [])
+
+    assert session.calls == []  # refused before touching the network
+
+
+def test_patch_retries_after_429_resending_the_same_body():
+    session = FakeSession(
+        [
+            FakeResponse({}, status_code=429, headers={"Retry-After": "1"}),
+            FakeResponse({"contact": {"uuid": "c1", "tags": []}}),
+        ]
+    )
+    waits = []
+    client = CallbellClient(
+        "key", session=session, sleep=waits.append, throttle=0, allow_writes=True
+    )
+
+    saved = client.update_contact_tags("c1", [])
+
+    assert saved["tags"] == []
+    assert waits == [1.0]
+    # tags is an absolute set, not a delta, so re-sending is idempotent
+    assert [c["json"] for c in session.calls] == [{"tags": []}, {"tags": []}]
 
 
 # --- Adapter: windowed "case-B" fetch ------------------------------------------
@@ -275,3 +372,7 @@ def test_build_adapter_wires_from_config():
     )
     adapter = build_adapter(config)
     assert isinstance(adapter, CallbellSourceAdapter)
+    # Structural, not documentary: everything wired through build_adapter — the
+    # Telegram bot included — is incapable of writing to Callbell.
+    with pytest.raises(CallbellError):
+        adapter._client.update_contact_tags("c1", [])

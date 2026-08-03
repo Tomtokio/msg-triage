@@ -11,13 +11,22 @@ Facts verified against real Callbell data (2026-07-16, see docs/dev_notes.md):
   server-side sort. So the time window is the primary filter: we page contacts,
   peek each one's most recent message, and stop after ``patience`` consecutive
   out-of-window contacts. We never page all 332 pages.
+
+Write-path facts verified on real data (2026-08-01):
+- ``PATCH /contacts/:uuid`` with ``{"tags": [...]}`` REPLACES the whole tag list
+  (it is an absolute set, not a delta), and an empty list really is saved.
+- ``GET /contacts/:uuid`` returns ``{"contact": {...}}`` — an OBJECT. The docs
+  claim an array of one element; they are wrong.
+
+⚠️ This module can WRITE. :class:`CallbellClient` refuses every write unless it
+was built with ``allow_writes=True`` — see the "Write path" section of the class.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -98,6 +107,23 @@ def _build_conversation(contact: dict, messages: tuple[Message, ...]) -> Convers
     )
 
 
+def _unwrap_contact(payload: dict, path: str) -> dict:
+    """Unwrap the ``{"contact": {...}}`` envelope of the single-contact endpoints.
+
+    VERIFIED on real data (2026-08-01): ``contact`` is an OBJECT. The Callbell docs
+    describe an array of one element and are wrong — ``payload["contact"][0]`` raises
+    ``KeyError``. We do not accept both shapes: if the envelope ever changes we want a
+    loud, named failure here, not a guess deep inside a write loop.
+    """
+    contact = payload.get("contact")
+    if not isinstance(contact, dict):
+        raise CallbellError(
+            f"unexpected envelope on {path}: expected {{'contact': {{...}}}}, "
+            f"got {type(contact).__name__}"
+        )
+    return contact
+
+
 def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
     """How long to wait after a 429: honour ``Retry-After`` else exponential backoff."""
     raw = response.headers.get("Retry-After")
@@ -119,6 +145,11 @@ class CallbellClient:
     ``session`` and ``sleep`` are injected so the adapter can be unit-tested with
     no real network and no real waiting. ``request_count`` tracks successful data
     pages fetched, so callers can log the cost of a run.
+
+    ⚠️ Read-only by default. ``allow_writes`` is the structural guard on the write
+    path: with it off (the default, and what :func:`build_adapter` wires for the
+    Telegram bot) the client *cannot* write, rather than merely being expected not
+    to. Only the one-shot maintenance scripts opt in.
     """
 
     def __init__(
@@ -130,6 +161,7 @@ class CallbellClient:
         sleep=time.sleep,
         throttle: float = DEFAULT_THROTTLE,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        allow_writes: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session if session is not None else requests.Session()
@@ -137,34 +169,64 @@ class CallbellClient:
         self._sleep = sleep
         self._throttle = throttle
         self._max_retries = max_retries
+        self._allow_writes = allow_writes
         self.request_count = 0
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json: dict | None = None,
+    ) -> dict:
+        """One HTTP call with throttle, 429 retry and error mapping.
+
+        The 429 retry re-sends the SAME body. That is safe for our writes because
+        ``tags`` is an absolute set and not a delta, so re-sending is idempotent.
+        """
         url = f"{self._base_url}{path}"
         for attempt in range(self._max_retries + 1):
-            response = self._session.get(url, headers=self._headers, params=params)
+            response = self._session.request(
+                method, url, headers=self._headers, params=params, json=json
+            )
             if response.status_code == 429:
                 wait = _retry_after_seconds(response, attempt)
                 logger.warning(
-                    "Callbell 429 on %s; waiting %.1fs (retry %d)", path, wait, attempt + 1
+                    "Callbell 429 on %s %s; waiting %.1fs (retry %d)",
+                    method,
+                    path,
+                    wait,
+                    attempt + 1,
                 )
                 self._sleep(wait)
                 continue
             if response.status_code >= 400:
-                raise CallbellError(f"Callbell error {response.status_code} on {path}")
+                raise CallbellError(
+                    f"Callbell error {response.status_code} on {method} {path}"
+                )
             self.request_count += 1
             if self._throttle:
                 self._sleep(self._throttle)
             return response.json()
         raise CallbellError(
-            f"Callbell still rate-limited on {path} after {self._max_retries} retries"
+            f"Callbell still rate-limited on {method} {path} "
+            f"after {self._max_retries} retries"
         )
 
-    def _paginate(self, path: str, list_key: str) -> Iterator[dict]:
-        """Yield items across pages, following ``meta.page``/``meta.pages``."""
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        return self._request("GET", path, params=params)
+
+    def _paginate(
+        self, path: str, list_key: str, params: dict | None = None
+    ) -> Iterator[dict]:
+        """Yield items across pages, following ``meta.page``/``meta.pages``.
+
+        ``params`` carries any extra query filter (e.g. ``tags[]``) alongside ``page``.
+        """
         page = 1
         while True:
-            payload = self._get(path, params={"page": page})
+            payload = self._get(path, params={**(params or {}), "page": page})
             yield from payload.get(list_key) or ()
             meta = payload.get("meta") or {}
             pages = meta.get("pages")
@@ -180,6 +242,42 @@ class CallbellClient:
     def iter_messages(self, contact_uuid: str) -> Iterator[dict]:
         """Yield raw messages for a contact, newest first (``createdAt`` DESC)."""
         return self._paginate(f"/contacts/{contact_uuid}/messages", "messages")
+
+    def iter_contacts_by_tag(self, tag: str) -> Iterator[dict]:
+        """Yield raw contacts carrying ``tag``, newest activity first.
+
+        Callbell matches tags case-INSENSITIVELY, so the result can include
+        variants of ``tag``. This is a way to *find* candidates cheaply, never a
+        proof of what a contact carries: callers needing an exact tag must
+        re-check the returned ``tags`` client-side.
+        """
+        return self._paginate("/contacts", "contacts", params={"tags[]": tag})
+
+    # --- Write path ------------------------------------------------------------
+    # Everything below mutates real customer records. It is unreachable unless the
+    # client was built with allow_writes=True, which build_adapter() never does.
+
+    def get_contact(self, contact_uuid: str) -> dict:
+        """Fetch one raw contact — used to re-read tags immediately before a write."""
+        path = f"/contacts/{contact_uuid}"
+        return _unwrap_contact(self._request("GET", path), path)
+
+    def update_contact_tags(self, contact_uuid: str, tags: Sequence[str]) -> dict:
+        """REPLACE a contact's entire tag list; return the contact as Callbell saved it.
+
+        ``tags`` is an absolute set, not a delta (verified 2026-08-01): to remove one
+        tag you send every other tag, and an empty list really does clear them all.
+        Deliberately the only write in this client — no generic ``patch()``, no delete,
+        no sending messages, no assignments.
+        """
+        if not self._allow_writes:
+            raise CallbellError(
+                "refusing to write: this CallbellClient is read-only "
+                "(built without allow_writes=True)"
+            )
+        path = f"/contacts/{contact_uuid}"
+        payload = self._request("PATCH", path, json={"tags": list(tags)})
+        return _unwrap_contact(payload, path)
 
 
 # --- Neutral adapter -----------------------------------------------------------
@@ -262,6 +360,9 @@ def build_adapter(
 
     The API key comes from ``config.callbell_api_key`` (never read from the
     environment directly here).
+
+    The client is built WITHOUT ``allow_writes``: everything wired through here —
+    the Telegram bot included — is structurally incapable of writing to Callbell.
     """
     client = CallbellClient(config.callbell_api_key, session=session)
     return CallbellSourceAdapter(client, patience=patience)
