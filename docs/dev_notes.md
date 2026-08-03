@@ -81,6 +81,32 @@ loro lavoro, cambierebbe il clima. Inserire questo vincolo nero su bianco nel sy
   assignedUser, source, channel{uuid,title,type}, note. Messaggio: text, status, uuid, from,
   to, createdAt, channel.
 
+## Scrittura su Callbell (VERIFICATO su dato reale, 2026-08-01)
+Accertato con probe manuali su contatti veri prima di scrivere una riga di codice, perché
+la scrittura è distruttiva e irreversibile. Vale per T10, non solo per la pulizia una tantum.
+- PATCH /contacts/:uuid con {"tags": [...]} ha semantica **REPLACE**: la lista è un insieme
+  ASSOLUTO, non un delta. Per rimuovere un tag si rimandano indietro tutti gli altri.
+  Corollario utile: il rinvio dopo una 429 è idempotente.
+- **{"tags": []} viene salvato davvero** — eco [] e rilettura []. Nessun no-op silenzioso su
+  lista vuota (il rischio classico su stack Rails, dove un array vuoto può arrivare al
+  controller come "parametro assente"). È il caso maggioritario, non un caso limite.
+- Un body PATCH **parziale non azzera i collaterali**: name, note, assignedUser, customFields
+  restano identici prima e dopo. Il campo che farebbe più male è "note", prosa delle colleghe.
+- I nomi dei tag sono preservati **byte per byte, spazio finale incluso**: riscrivendo
+  "Tommaso rispondi! " torna indietro con lo spazio. Quindi un backup dei tag precedenti è un
+  undo eseguibile, non un verbale.
+- **ENVELOPE: GET /contacts/:uuid restituisce {"contact": {...}} — un OGGETTO.** La doc
+  ufficiale dichiara un array di un elemento ed è SBAGLIATA: json["contact"][0] solleva
+  KeyError. Stessa forma nell'eco della PATCH. Nel codice l'unwrap sta in _unwrap_contact(),
+  che sull'envelope inatteso solleva CallbellError invece di indovinare.
+- Il filtro ?tags[]= è **case-insensitive**: serve a TROVARE i candidati, mai a stabilire
+  cosa un contatto porti davvero. Ricontrollo esatto lato client obbligatorio, senza strip()
+  né lower().
+- Garanzia strutturale nel codice: CallbellClient è read-only salvo allow_writes=True.
+  build_adapter() non lo passa, quindi il bot Telegram NON PUÒ scrivere — non è che non
+  dovrebbe. L'unica scrittura esposta è update_contact_tags(): niente patch() generico,
+  niente delete, niente invio messaggi, niente assegnazioni.
+
 ## Anti-pattern (NON fare)
 - NON usare webhook in v0. Pull a comando.
 - NON esporre chiavi lato client. Tutto sul backend Hetzner.
