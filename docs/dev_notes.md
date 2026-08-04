@@ -107,6 +107,18 @@ la scrittura è distruttiva e irreversibile. Vale per T10, non solo per la puliz
   dovrebbe. L'unica scrittura esposta è update_contact_tags(): niente patch() generico,
   niente delete, niente invio messaggi, niente assegnazioni.
 
+## Censimento dei tag stantii (VERIFICATO su dato reale, 2026-08-04)
+- I tag con contatti sono quattro, ed è la lista TARGET_TAGS di cleanup_stale_tags.py:
+  "Ricoverato" (~50), "Risolto" (19), "Noemi rispond!" (11, senza la i — si scrive così),
+  "dare Appuntamento" (9). "Tommaso rispondi! " è già stato ripulito.
+- Zero contatti, quindi fuori dalla lista: Contattare Urgente, Emergenza, Inviare Fattura,
+  Michela rispondi!, Stiamo Arrivando.
+- **Un contatto può portarne più d'uno** (visto: ['Ricoverato', 'Risolto']). Quindi lo script
+  raccoglie i candidati di tutti i tag, deduplica per contact_id e fa **una sola PATCH per
+  contatto**: ciclare tag per tag scrivendo strada facendo raddoppierebbe le finestre di
+  rischio sullo stesso contatto. Toglie solo i tag visti in discovery: uno aggiunto da una
+  collega nel frattempo non è mai stato misurato sulla soglia, quindi non si tocca.
+
 ## Anti-pattern (NON fare)
 - NON usare webhook in v0. Pull a comando.
 - NON esporre chiavi lato client. Tutto sul backend Hetzner.
