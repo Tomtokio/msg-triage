@@ -24,7 +24,8 @@ cleanup = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = cleanup
 _spec.loader.exec_module(cleanup)
 
-TAG = cleanup.TARGET_TAG  # "Tommaso rispondi! " — exclamation mark AND trailing space
+TAG, TAG2 = cleanup.TARGET_TAGS[0], cleanup.TARGET_TAGS[1]  # "Ricoverato", "Risolto"
+OTHER = "Sterilizzato"  # deliberately NOT in TARGET_TAGS: must always survive
 
 # Fixed "now" so the 14-day boundary is deterministic.
 NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -61,13 +62,23 @@ class FakeClient:
         self._patch_error = patch_error
         self._echo = echo or {}
         self.patches = []
+        self.message_calls = []  # one entry per iter_messages() call, to catch refetches
         self.tags_by_uuid = {c["uuid"]: list(c.get("tags") or ()) for c in contacts}
 
     def iter_contacts_by_tag(self, tag):
-        yield from self._contacts
+        # Deliberately looser than an exact match — the real filter is at least
+        # case-insensitive — so variants reach the code under test. Being handed
+        # something you did not ask for is exactly what the client-side re-check is for.
+        wanted = tag.strip().lower()
+        return [
+            c
+            for c in self._contacts
+            if any(t.strip().lower() == wanted for t in c.get("tags") or ())
+        ]
 
     def iter_messages(self, contact_uuid):
-        yield from self._messages.get(contact_uuid, [])
+        self.message_calls.append(contact_uuid)
+        return list(self._messages.get(contact_uuid, []))
 
     def get_contact(self, contact_uuid):
         return {"uuid": contact_uuid, "tags": list(self.tags_by_uuid[contact_uuid])}
@@ -93,7 +104,20 @@ def _run(client, tmp_path, *, execute=True, limit=None):
     return code, "\n".join(lines)
 
 
+def _for(discoveries, tag):
+    """The Discovery of one tag, by name."""
+    return next(d for d in discoveries if d.tag == tag)
+
+
 # --- Phase 1: selection ---------------------------------------------------------
+
+
+def test_one_discovery_per_target_tag_in_order():
+    client = FakeClient([], {})
+
+    discoveries = cleanup.discover(client, now=NOW)
+
+    assert [d.tag for d in discoveries] == list(cleanup.TARGET_TAGS)
 
 
 def test_selects_only_contacts_older_than_the_threshold():
@@ -106,7 +130,7 @@ def test_selects_only_contacts_older_than_the_threshold():
         },
     )
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert [c.contact_id for c in discovery.stale] == ["old"]
     # exactly 14 days is NOT stale: the rule is strictly older than
@@ -120,7 +144,7 @@ def test_uses_the_most_recent_message_ignoring_system_notes():
         {"c1": [_system_note(THREE_DAYS_AGO), _msg(TWENTY_DAYS_AGO)]},
     )
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert [c.contact_id for c in discovery.stale] == ["c1"]
 
@@ -136,7 +160,7 @@ def test_colleague_note_counts_as_human_activity():
     }
     client = FakeClient([_contact("c1")], {"c1": [human_note, _msg(TWENTY_DAYS_AGO)]})
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert discovery.stale == []
     assert [c.contact_id for c in discovery.recent] == ["c1"]
@@ -145,11 +169,11 @@ def test_colleague_note_counts_as_human_activity():
 def test_exact_recheck_rejects_a_case_insensitive_variant():
     """The server filter is case-insensitive; correctness never leans on it."""
     client = FakeClient(
-        [_contact("exact"), _contact("variant", tags=("tommaso rispondi!",))],
+        [_contact("exact"), _contact("variant", tags=("ricoverato",))],
         {"exact": [_msg(TWENTY_DAYS_AGO)], "variant": [_msg(TWENTY_DAYS_AGO)]},
     )
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert [c.contact_id for c in discovery.stale] == ["exact"]
     assert [c.contact_id for c in discovery.variants] == ["variant"]
@@ -158,7 +182,7 @@ def test_exact_recheck_rejects_a_case_insensitive_variant():
 def test_contact_without_messages_is_left_alone():
     client = FakeClient([_contact("c1")], {"c1": []})
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert discovery.stale == []
     assert [c.contact_id for c in discovery.undatable] == ["c1"]
@@ -170,7 +194,7 @@ def test_contact_with_only_system_notes_is_not_datable():
         {"c1": [_system_note(THREE_DAYS_AGO), _system_note(TWENTY_DAYS_AGO)]},
     )
 
-    discovery = cleanup.discover(client, now=NOW)
+    discovery = _for(cleanup.discover(client, now=NOW), TAG)
 
     assert discovery.stale == []
     assert [c.contact_id for c in discovery.undatable] == ["c1"]
@@ -184,6 +208,57 @@ def test_too_many_candidates_aborts_before_any_work():
         cleanup.discover(client, now=NOW)
 
     assert client.patches == []
+
+
+def test_age_is_measured_once_per_contact_across_tags():
+    """Two tags, one contact: refetching would also risk two different verdicts."""
+    client = FakeClient(
+        [_contact("c1", tags=(TAG, TAG2))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+
+    cleanup.discover(client, now=NOW)
+
+    assert client.message_calls == ["c1"]
+
+
+# --- Dedup across tags ----------------------------------------------------------
+
+
+def test_merge_collects_every_target_tag_of_the_same_contact():
+    client = FakeClient(
+        [_contact("c1", tags=(TAG, OTHER, TAG2))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+
+    targets = cleanup.merge_targets(cleanup.discover(client, now=NOW))
+
+    assert len(targets) == 1
+    assert targets[0].targets_present == (TAG, TAG2)  # in TARGET_TAGS order
+    assert targets[0].tags_after == [OTHER]
+    assert not targets[0].leaves_empty
+
+
+def test_merge_orders_by_tag_list_then_by_api_order():
+    client = FakeClient(
+        [_contact("solo_tag2", tags=(TAG2,)), _contact("c1")],
+        {"solo_tag2": [_msg(TWENTY_DAYS_AGO)], "c1": [_msg(TWENTY_DAYS_AGO)]},
+    )
+
+    targets = cleanup.merge_targets(cleanup.discover(client, now=NOW))
+
+    # TARGET_TAGS order wins over API order: TAG is discovered before TAG2.
+    assert [t.contact_id for t in targets] == ["c1", "solo_tag2"]
+
+
+def test_merge_ignores_the_tag_the_contact_does_not_carry_exactly():
+    """Exact under one tag, variant under another: only the exact one is removed."""
+    client = FakeClient(
+        [_contact("c1", tags=("ricoverato", TAG2))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+
+    targets = cleanup.merge_targets(cleanup.discover(client, now=NOW))
+
+    assert [t.targets_present for t in targets] == [(TAG2,)]
+    assert targets[0].tags_after == ["ricoverato"]
 
 
 # --- Phase 2: execution ---------------------------------------------------------
@@ -200,19 +275,29 @@ def test_dry_run_writes_nothing_anywhere(tmp_path):
     assert "DRY-RUN" in output
 
 
+def test_dry_run_reports_one_section_per_tag(tmp_path):
+    client = FakeClient([_contact("c1")], {"c1": [_msg(TWENTY_DAYS_AGO)]})
+
+    _, output = _run(client, tmp_path, execute=False)
+
+    for tag in cleanup.TARGET_TAGS:
+        assert f"=== TAG {tag!r}" in output
+    assert "=== RIEPILOGO COMPLESSIVO ===" in output
+
+
 def test_removal_keeps_the_other_tags(tmp_path):
     client = FakeClient(
-        [_contact("c1", tags=("Risolto", TAG))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+        [_contact("c1", tags=(OTHER, TAG))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
     )
 
     code, _ = _run(client, tmp_path)
 
     assert code == 0
-    assert client.patches == [("c1", ["Risolto"])]
+    assert client.patches == [("c1", [OTHER])]
 
 
 def test_removal_sends_an_empty_list_when_it_was_the_only_tag(tmp_path):
-    """The majority case: ~128 of the ~130 contacts carry nothing else."""
+    """The majority case: most of these contacts carry nothing else."""
     client = FakeClient([_contact("c1")], {"c1": [_msg(TWENTY_DAYS_AGO)]})
 
     code, _ = _run(client, tmp_path)
@@ -221,9 +306,46 @@ def test_removal_sends_an_empty_list_when_it_was_the_only_tag(tmp_path):
     assert client.patches == [("c1", [])]
 
 
+def test_two_target_tags_are_removed_in_a_single_patch(tmp_path):
+    """The new case: one contact, two tags of the list, ONE write."""
+    client = FakeClient(
+        [_contact("c1", tags=(TAG, TAG2, OTHER))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+
+    code, output = _run(client, tmp_path)
+
+    assert code == 0
+    assert client.patches == [("c1", [OTHER])]  # exactly one PATCH, both tags gone
+    assert "1 contatto pulito (2 tag rimossi)" in output
+
+
+def test_a_target_tag_added_after_discovery_is_left_alone(tmp_path):
+    """Never measured against the threshold, so not ours to remove."""
+    client = FakeClient([_contact("c1")], {"c1": [_msg(TWENTY_DAYS_AGO)]})
+    client.tags_by_uuid["c1"] = [TAG, TAG2]  # a colleague tagged it in the meantime
+
+    code, _ = _run(client, tmp_path)
+
+    assert code == 0
+    assert client.patches == [("c1", [TAG2])]
+
+
+def test_partial_removal_when_one_target_tag_is_already_gone(tmp_path):
+    client = FakeClient(
+        [_contact("c1", tags=(TAG, TAG2))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+    client.tags_by_uuid["c1"] = [TAG2]  # TAG removed by hand between the two phases
+
+    code, output = _run(client, tmp_path)
+
+    assert code == 0
+    assert client.patches == [("c1", [])]
+    assert "1 contatto pulito (1 tag rimosso)" in output
+
+
 def test_backup_line_is_written_before_the_patch(tmp_path):
     client = FakeClient(
-        [_contact("c1", tags=("Risolto", TAG), name="Rossi")],
+        [_contact("c1", tags=(OTHER, TAG, TAG2), name="Rossi")],
         {"c1": [_msg(TWENTY_DAYS_AGO)]},
         patch_error=CallbellError("boom"),
     )
@@ -231,18 +353,19 @@ def test_backup_line_is_written_before_the_patch(tmp_path):
     code, _ = _run(client, tmp_path)
 
     assert code == 1  # the failure is reported...
-    assert client.patches == [("c1", ["Risolto"])]  # ...the PATCH was attempted...
+    assert client.patches == [("c1", [OTHER])]  # ...the PATCH was attempted...
     # ...and the record survives it, with the tag list exactly as it was
     line = json.loads((tmp_path / "backup.jsonl").read_text(encoding="utf-8").strip())
     assert line["contact_id"] == "c1"
     assert line["name"] == "Rossi"
-    assert line["tags_before"] == ["Risolto", TAG]
+    assert line["tags_before"] == [OTHER, TAG, TAG2]
+    assert line["tags_removed"] == [TAG, TAG2]
     assert line["last_message_at"].startswith("2026-07-12")
 
 
-def test_limit_stops_after_the_first_contact(tmp_path):
+def test_limit_counts_contacts_not_tags(tmp_path):
     client = FakeClient(
-        [_contact("c1"), _contact("c2")],
+        [_contact("c1"), _contact("c2", tags=(TAG2,))],
         {"c1": [_msg(TWENTY_DAYS_AGO)], "c2": [_msg(TWENTY_DAYS_AGO)]},
     )
 
@@ -253,8 +376,10 @@ def test_limit_stops_after_the_first_contact(tmp_path):
 
 
 def test_contact_already_cleaned_is_skipped_not_rewritten(tmp_path):
-    client = FakeClient([_contact("c1")], {"c1": [_msg(TWENTY_DAYS_AGO)]})
-    client.tags_by_uuid["c1"] = []  # a colleague removed it between discovery and write
+    client = FakeClient(
+        [_contact("c1", tags=(TAG, TAG2))], {"c1": [_msg(TWENTY_DAYS_AGO)]}
+    )
+    client.tags_by_uuid["c1"] = []  # a colleague removed them between discovery and write
 
     code, output = _run(client, tmp_path)
 
@@ -266,9 +391,9 @@ def test_contact_already_cleaned_is_skipped_not_rewritten(tmp_path):
 def test_normalised_echo_aborts_the_run(tmp_path):
     """If Callbell hands back anything but what we sent, we stop immediately."""
     client = FakeClient(
-        [_contact("c1", tags=("Risolto", TAG)), _contact("c2")],
+        [_contact("c1", tags=(OTHER, TAG)), _contact("c2")],
         {"c1": [_msg(TWENTY_DAYS_AGO)], "c2": [_msg(TWENTY_DAYS_AGO)]},
-        echo={"c1": ["risolto"]},  # case-folded on the way back
+        echo={"c1": ["sterilizzato"]},  # case-folded on the way back
     )
 
     with pytest.raises(cleanup.Abort):
