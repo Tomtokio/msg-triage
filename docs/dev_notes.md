@@ -81,9 +81,11 @@ loro lavoro, cambierebbe il clima. Inserire questo vincolo nero su bianco nel sy
   assignedUser, source, channel{uuid,title,type}, note. Messaggio: text, status, uuid, from,
   to, createdAt, channel.
 
-## Scrittura su Callbell (VERIFICATO su dato reale, 2026-08-01)
+## Scrittura su Callbell (VERIFICATO su dato reale, 2026-08-01 e 2026-08-05)
 Accertato con probe manuali su contatti veri prima di scrivere una riga di codice, perché
 la scrittura è distruttiva e irreversibile. Vale per T10, non solo per la pulizia una tantum.
+I fatti sui tag sono del 2026-08-01; quelli sul campo name del 2026-08-05 (T10/PR0, probe
+scripts/probe_rename.py, nove verifiche tutte passate).
 - PATCH /contacts/:uuid con {"tags": [...]} ha semantica **REPLACE**: la lista è un insieme
   ASSOLUTO, non un delta. Per rimuovere un tag si rimandano indietro tutti gli altri.
   Corollario utile: il rinvio dopo una 429 è idempotente.
@@ -102,10 +104,23 @@ la scrittura è distruttiva e irreversibile. Vale per T10, non solo per la puliz
 - Il filtro ?tags[]= è **case-insensitive**: serve a TROVARE i candidati, mai a stabilire
   cosa un contatto porti davvero. Ricontrollo esatto lato client obbligatorio, senza strip()
   né lower().
+- **Il campo name si scrive davvero, e sopravvive byte per byte**: "Probe Àèìòù  T10 " è
+  tornato identico nell'eco della PATCH e nella rilettura — accenti, doppio spazio interno e
+  spazio finale intatti, nessuna normalizzazione lato server. Non era scontato: fino a qui
+  era accertato solo che un PATCH parziale non AZZERASSE name, non che scriverlo funzionasse.
+- Scrivere name **non tocca i collaterali**, verificato in tutti e quattro gli stadi del probe
+  (eco, rilettura, ripristino, rilettura finale): tags, note, assignedUser, customFields,
+  phoneNumber identici prima e dopo. Stessa clemenza già nota per il PATCH dei tag, ora
+  accertata anche sull'altro verso.
+- L'eco della PATCH di name ha la STESSA forma {"contact": {...}} della GET: _unwrap_contact()
+  vale per entrambe, non serve un secondo unwrap.
+- Il ripristino ha rimesso il nome precedente esatto — " Cognome", **spazio INIZIALE incluso**
+  (il nome vero resta fuori da qui: dev_notes sta su GitHub). Corollario: la riga di backup
+  fsync'd prima della PATCH è un undo eseguibile anche per il nome, non solo per i tag.
 - Garanzia strutturale nel codice: CallbellClient è read-only salvo allow_writes=True.
   build_adapter() non lo passa, quindi il bot Telegram NON PUÒ scrivere — non è che non
-  dovrebbe. L'unica scrittura esposta è update_contact_tags(): niente patch() generico,
-  niente delete, niente invio messaggi, niente assegnazioni.
+  dovrebbe. Le sole due scritture esposte sono update_contact_tags() e update_contact_name():
+  niente patch() generico, niente delete, niente invio messaggi, niente assegnazioni.
 
 ## Censimento dei tag stantii (VERIFICATO su dato reale, 2026-08-04)
 - I tag con contatti sono quattro, ed è la lista TARGET_TAGS di cleanup_stale_tags.py:

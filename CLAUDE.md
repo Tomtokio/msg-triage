@@ -93,12 +93,13 @@ bot per intercettare il polling: romperebbe il silenzio verso gli utenti non aut
 5. `/contacts` ~332 pagine, ordinato per attività: la finestra temporale è il filtro primario, non paginare tutto.
 Vedi `docs/dev_notes.md` per il dettaglio.
 
-## Fatti Callbell sulla SCRITTURA, verificati sul dato reale (2026-08-01)
+## Fatti Callbell sulla SCRITTURA, verificati sul dato reale (2026-08-01 e 2026-08-05)
 1. `PATCH /contacts/:uuid` con `{"tags": [...]}` è **REPLACE**: la lista è un insieme assoluto, non un delta. Per rimuovere si rimandano tutti gli altri tag.
 2. `{"tags": []}` viene salvato davvero: nessun no-op silenzioso sulla lista vuota.
 3. Un body PATCH parziale **non** azzera i collaterali (`name`, `note`, `assignedUser`, `customFields`).
 4. I nomi dei tag sopravvivono **byte per byte, spazio finale incluso**.
 5. **`GET /contacts/:uuid` → `{"contact": {...}}`, un OGGETTO — la doc dice array di un elemento ed è sbagliata** (`json["contact"][0]` → `KeyError`).
 6. Il filtro `?tags[]=` è case-insensitive: serve a trovare i candidati, mai a stabilire cosa un contatto porti. Ricontrollo esatto lato client, senza `strip()` né `lower()`.
-7. `CallbellClient` è read-only salvo `allow_writes=True`, che `build_adapter()` non passa: il bot **non può** scrivere. Unica scrittura esposta: `update_contact_tags()`.
+7. `CallbellClient` è read-only salvo `allow_writes=True`, che `build_adapter()` non passa: il bot **non può** scrivere. Le sole due scritture esposte: `update_contact_tags()` e `update_contact_name()`.
+8. **Anche `name` si scrive davvero e sopravvive byte per byte** (accenti, doppio spazio, spazio finale), senza toccare i collaterali e con la stessa forma di envelope nell'eco. Verificato 2026-08-05 con `scripts/probe_rename.py`.
 Vedi `docs/dev_notes.md` per il dettaglio.
