@@ -150,6 +150,10 @@ class CallbellClient:
     path: with it off (the default, and what :func:`build_adapter` wires for the
     Telegram bot) the client *cannot* write, rather than merely being expected not
     to. Only the one-shot maintenance scripts opt in.
+
+    The write surface is deliberately narrow and enumerated: ``update_contact_tags``
+    and ``update_contact_name``, nothing else. No generic ``patch()``, no delete, no
+    sending messages, no assignments — the endpoints exist, we do not expose them.
     """
 
     def __init__(
@@ -257,6 +261,14 @@ class CallbellClient:
     # Everything below mutates real customer records. It is unreachable unless the
     # client was built with allow_writes=True, which build_adapter() never does.
 
+    def _require_writes(self) -> None:
+        """The structural guard, in one place: refuse before touching the network."""
+        if not self._allow_writes:
+            raise CallbellError(
+                "refusing to write: this CallbellClient is read-only "
+                "(built without allow_writes=True)"
+            )
+
     def get_contact(self, contact_uuid: str) -> dict:
         """Fetch one raw contact — used to re-read tags immediately before a write."""
         path = f"/contacts/{contact_uuid}"
@@ -267,16 +279,28 @@ class CallbellClient:
 
         ``tags`` is an absolute set, not a delta (verified 2026-08-01): to remove one
         tag you send every other tag, and an empty list really does clear them all.
-        Deliberately the only write in this client — no generic ``patch()``, no delete,
-        no sending messages, no assignments.
         """
-        if not self._allow_writes:
-            raise CallbellError(
-                "refusing to write: this CallbellClient is read-only "
-                "(built without allow_writes=True)"
-            )
+        self._require_writes()
         path = f"/contacts/{contact_uuid}"
         payload = self._request("PATCH", path, json={"tags": list(tags)})
+        return _unwrap_contact(payload, path)
+
+    def update_contact_name(self, contact_uuid: str, name: str) -> dict:
+        """Set a contact's ``name``; return the contact as Callbell saved it.
+
+        The official docs list ``name`` among the PATCH body fields, and a partial
+        body is known not to clear the collaterals (verified 2026-08-01 while probing
+        ``tags``). What no doc can settle is whether Callbell stores the string it is
+        given *unchanged* — the very same doc page gets the response envelope wrong —
+        so this is probed on a real contact before T10 relies on it:
+        ``scripts/probe_rename.py``.
+
+        Like ``tags``, ``name`` is an absolute value and not a delta, so the 429 retry
+        in ``_request`` re-sends the same body harmlessly.
+        """
+        self._require_writes()
+        path = f"/contacts/{contact_uuid}"
+        payload = self._request("PATCH", path, json={"name": name})
         return _unwrap_contact(payload, path)
 
 
