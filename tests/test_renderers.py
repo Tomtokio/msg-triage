@@ -28,10 +28,15 @@ from msg_triage.renderers import (
     render_voice,
 )
 from msg_triage.triage_engine import (
+    Animale,
     ConversationTriage,
+    Dimissione,
+    Fatti,
     Gruppo,
     Presidio,
     Promessa,
+    Ricovero,
+    StatoDimissione,
     Temperatura,
     TriageResult,
     Urgenza,
@@ -50,6 +55,7 @@ def _entry(
     stato_sintetico: str = "stato",
     azione_suggerita: str = "",
     promessa_rilevata: Promessa | None = None,
+    fatti: Fatti | None = None,
 ) -> ConversationTriage:
     return ConversationTriage(
         contact_id=contact_id,
@@ -62,6 +68,7 @@ def _entry(
         stato_sintetico=stato_sintetico,
         azione_suggerita=azione_suggerita,
         promessa_rilevata=promessa_rilevata,
+        fatti=fatti,
     )
 
 
@@ -766,3 +773,19 @@ def test_renderers_are_deterministic():
     )
     for render in (render_schema, render_table, render_voice):
         assert render(r) == render(r)
+
+
+def test_renderers_ignore_the_t10_facts():
+    """The three formats are the product and must not move when ENABLE_PROPOSALS goes
+    on: the facts feed the proposal rules, they are never shown to the reader."""
+    fatti = Fatti(
+        ricovero=Ricovero.IN_CORSO,
+        dimissione=Dimissione(stato=StatoDimissione.FISSATA, quando="2026-08-06"),
+        animali=(Animale(specie="coniglio", nome="Bunny"),),
+        proprietario="Sig.ra Rossi",
+    )
+    without = _result(_entry(contact_id="a"))
+    with_facts = _result(_entry(contact_id="a", fatti=fatti))
+
+    for render in (render_schema, render_table, render_voice):
+        assert render(with_facts) == render(without)

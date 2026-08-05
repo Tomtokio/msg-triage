@@ -23,6 +23,12 @@ REQUIRED_ENV_VARS: tuple[str, ...] = (
 # The one required var that is not a free-form string but a numeric id.
 _INT_KEY = "TELEGRAM_ALLOWED_USER_ID"
 
+# Optional feature flags. They stay OUT of REQUIRED_ENV_VARS on purpose: a feature
+# must never be able to prevent the bot from booting (same reasoning as the
+# TELEMETRY_* vars). Absent or blank means the default.
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or malformed."""
@@ -30,10 +36,11 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class Config:
-    """Validated application secrets.
+    """Validated application secrets, plus the optional feature flags.
 
     Do not log this object as a whole: it holds secret values. Use
-    ``present_keys`` for safe diagnostics (names only).
+    ``present_keys`` for safe diagnostics (names only). The flags are not secret
+    and are safe to log one by one.
     """
 
     callbell_api_key: str
@@ -42,6 +49,8 @@ class Config:
     telegram_allowed_user_id: int
     supabase_url: str
     supabase_key: str
+    # Optional, defaults to off: T10 state-fact extraction and (later) proposals.
+    enable_proposals: bool = False
 
 
 def _read(env: dict[str, str], name: str) -> str | None:
@@ -51,6 +60,28 @@ def _read(env: dict[str, str], name: str) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _read_bool(env: dict[str, str], name: str, *, default: bool = False) -> bool:
+    """Read an optional boolean flag; absent or blank falls back to ``default``.
+
+    An unrecognizable value raises instead of silently defaulting: a flag typed
+    wrong is a configuration error, and discovering it as "the feature simply
+    never ran" costs an afternoon. The message names the variable and the accepted
+    values but never echoes what was typed.
+    """
+    raw = _read(env, name)
+    if raw is None:
+        return default
+    value = raw.lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ConfigError(
+        f"{name} must be a boolean: "
+        f"{'/'.join(sorted(_TRUE_VALUES))} or {'/'.join(sorted(_FALSE_VALUES))}."
+    )
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:
@@ -84,6 +115,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         telegram_allowed_user_id=telegram_allowed_user_id,
         supabase_url=values["SUPABASE_URL"],
         supabase_key=values["SUPABASE_KEY"],
+        enable_proposals=_read_bool(env, "ENABLE_PROPOSALS"),
     )
 
 
