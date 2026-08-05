@@ -236,3 +236,56 @@ Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia da
   l'accorpamento del rumore regge; se il divieto sul nome fa scivolare il modello nel difetto
   opposto, cioè motivi generici che non identificano più la conversazione (era il guasto
   della terza taratura).
+
+---
+
+## BLOCCO FATTI DI STATO (testo da usare — T10)
+
+Oltre al giudizio, per ogni conversazione compila il campo `fatti`.
+
+Questi campi non cambiano il giudizio: gruppo, urgenza, presidio, temperatura, motivo e stato sintetico si scrivono esattamente come li scriveresti senza questa sezione. I fatti sono un estratto meccanico di ciò che è già scritto nei messaggi, non una seconda valutazione.
+
+Oggi è {oggi}, fuso Europe/Rome: risolvi rispetto a questa data espressioni come "domani" o "lunedì", e scrivi le date nel formato AAAA-MM-GG. Se la data non è ricavabile, lascia null.
+
+Sul ricovero: `in_corso` solo se i messaggi dicono esplicitamente che l'animale è in degenza da noi. Averlo portato in visita, o averlo portato ieri, non è un ricovero: lì il campo è `non_menzionato`.
+
+Sulla dimissione guarda il tempo del verbo: "lo dimettiamo domani alle 16" è fissata, "l'abbiamo ritirato ieri" è avvenuta. Se nei messaggi non se ne parla, il campo è null.
+
+Continui a marcare la specie tra doppi asterischi nel testo, come sempre: questi campi non la sostituiscono.
+
+Se una cosa non è scritta nei messaggi, non c'è: usa "non_menzionato", null, lista vuota. Non dedurre e non inventare specie, nomi o date. Il nome del contatto non è una fonte: compila `proprietario` solo se il cliente si firma o si nomina scrivendo.
+
+---
+
+## Note sul blocco fatti (NON parte del prompt)
+
+- Va nel **messaggio user, in coda, dopo il transcript** — mai nel system prompt. Due ragioni.
+  La prima è l'invariante di T10/PR1: a flag spento la richiesta al modello dev'essere identica
+  byte per byte a prima, e il system prompt è una costante caricata all'import. La seconda è che
+  un blocco messo *prima* del transcript diventa la lente con cui il modello legge ogni
+  messaggio: è esattamente il meccanismo con cui la description "Urgenza clinica (filtro
+  esotici/aviari)" piegò tutto il giudizio nella seconda taratura. In coda si legge come un
+  post-processing.
+- **Questa sezione sta dopo "Note per lo sviluppatore" apposta.** `load_triage_system()` estrae
+  tutto ciò che sta *fra* i due marcatori del system prompt: una sezione infilata prima delle
+  note finirebbe dentro `TRIAGE_SYSTEM` e romperebbe l'invariante in silenzio. C'è un test che
+  lo impedisce (`test_triage_system_excludes_the_facts_block`).
+- `{oggi}` è un segnaposto sostituito da `TriageEngine` con la data corrente **in Europe/Rome**.
+  Il messaggio user porta già l'ora di riferimento, ma in UTC: attorno a mezzanotte "oggi" e
+  "domani" slitterebbero di un giorno, e `Dimissione oggi` è precisamente una regola same-day.
+  La data locale sta qui, e non nella parte condivisa del messaggio, perché qui è flag-gated.
+- La riga sul ricovero è quella che tiene basso il volume delle proposte: senza la parola
+  "esplicitamente" e senza il controesempio ("l'ho portato ieri"), `in_corso` scivola su
+  qualunque conversazione che nomini una visita, e la regola di PR2 proporrebbe `Ricoverato` su
+  mezzo archivio. La soglia sta qui, non nelle regole a valle.
+- La clausola sul marcatore `**specie**` non è pleonastica: chiedere `animali[].specie` in un
+  campo strutturato può far calare la marcatura in prosa (il modello sente di averla già detta),
+  e quella marcatura è l'unica fonte di `extract_species()`, quindi della colonna `specie` su
+  Supabase e dell'autosufficienza delle voci. Da misurare a ogni A/B, non da dare per scontato.
+- Nessun esempio in forma `Nome: valore` e nessun nome di cliente negli esempi: la quarta
+  taratura ha dovuto riscrivere l'unico esempio del documento proprio perché era il calco
+  strutturale dell'output sbagliato.
+- Da osservare al primo A/B (flag spento vs acceso, stesse conversazioni): se `gruppo`,
+  `urgenza`, `presidio`, `temperatura` e `motivo` restano identici; se l'hit-rate di
+  `extract_species` cala; se compaiono date inventate dove i messaggi non ne portano; se
+  `proprietario` riecheggia il nome del contatto invece di venire dai messaggi.

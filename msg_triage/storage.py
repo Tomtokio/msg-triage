@@ -121,8 +121,16 @@ def _build_state_record(
     ``last_message_at`` (which lives on the neutral conversation).
 
     Columns mirror the dataclass attribute names one-to-one, so there is no mapping
-    to keep in sync — and nothing the triage said about a conversation is dropped,
+    to keep in sync, and nothing the triage JUDGED about a conversation is dropped —
     which is what keeps T4 from needing a second migration.
+
+    One deliberate exception since T10: ``fatti`` is NOT persisted. There are no
+    columns for it, and migrations are applied by hand; the facts are consumed
+    inside the run that produced them, by the proposal rules. Note also that
+    ``specie`` keeps coming from the ``**...**`` marker in the model's prose and not
+    from ``fatti.animali``: otherwise the very same messages would store a different
+    ``specie`` depending on a feature flag, and the history would become
+    flag-dependent.
     """
     promessa = entry.promessa_rilevata
     return {

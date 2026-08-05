@@ -426,4 +426,11 @@ def run_bot(config: Config) -> None:
     """Build the bot and start long-polling (blocking; no webhooks in v0)."""
     application = build_bot(config)
     logger.info("VetTriage bot avviato (long polling). Comando: /triage [ore].")
+    # ENABLE_PROPOSALS is optional, so it never shows up in present_keys(): without
+    # this line the only way to find out whether the feature is on is to read the
+    # .env on the VPS. Not a secret, safe to log.
+    logger.info(
+        "Fatti di stato (T10, ENABLE_PROPOSALS): %s",
+        "attivi" if config.enable_proposals else "spenti",
+    )
     application.run_polling()

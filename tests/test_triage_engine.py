@@ -17,14 +17,19 @@ from msg_triage.triage_engine import (
     DEFAULT_MODEL,
     TRIAGE_OPERATION,
     TRIAGE_SYSTEM,
+    Animale,
     Gruppo,
     Presidio,
     Promessa,
+    Ricovero,
+    StatoDimissione,
     Temperatura,
     TriageEngine,
     TriageError,
     Urgenza,
+    build_output_schema,
     build_triage_engine,
+    load_facts_block,
     load_triage_system,
     parse_triage_response,
     serialize_conversations,
@@ -382,8 +387,8 @@ def test_parse_raises_when_conversazioni_missing():
 # --- Factory -------------------------------------------------------------------
 
 
-def test_build_triage_engine_uses_injected_client():
-    config = Config(
+def _config(**over) -> Config:
+    base = dict(
         callbell_api_key="k",
         anthropic_api_key="a",
         telegram_bot_token="t",
@@ -391,9 +396,320 @@ def test_build_triage_engine_uses_injected_client():
         supabase_url="u",
         supabase_key="s",
     )
+    base.update(over)
+    return Config(**base)
+
+
+def test_build_triage_engine_uses_injected_client():
     client = FakeClient([])
 
-    engine = build_triage_engine(config, client=client)
+    engine = build_triage_engine(_config(), client=client)
 
     assert isinstance(engine, TriageEngine)
     assert engine._client is client
+
+
+def test_build_triage_engine_follows_the_flag():
+    assert build_triage_engine(_config(), client=FakeClient([]))._extract_facts is False
+
+    engine = build_triage_engine(_config(enable_proposals=True), client=FakeClient([]))
+
+    assert engine._extract_facts is True
+
+
+def test_build_triage_engine_explicit_override_wins_over_the_flag():
+    """What makes the real A/B two commands instead of two edits to .env."""
+    forced_on = build_triage_engine(_config(), client=FakeClient([]), extract_facts=True)
+    forced_off = build_triage_engine(
+        _config(enable_proposals=True), client=FakeClient([]), extract_facts=False
+    )
+
+    assert forced_on._extract_facts is True
+    assert forced_off._extract_facts is False
+
+
+# --- T10: the byte-for-byte guardians ------------------------------------------
+#
+# These exist because, before them, NOTHING in this suite enforced the invariant the
+# whole facts design rests on: with the flag off, the request sent to the model is
+# the request of before, byte for byte. The old prompt test only checked a prefix, a
+# substring and a suffix — a new section dropped in the wrong half of the Markdown
+# would have passed all three while TRIAGE_SYSTEM silently grew.
+
+# Every judgment property, in the exact order the model receives them. The order is
+# not cosmetic: insertion order is what the SDK serializes, and it is also prompt
+# order — moving `fatti` above `motivo` would change the sequence in which the model
+# fills the fields.
+_JUDGMENT_PROPERTIES = [
+    "ref",
+    "gruppo",
+    "motivo",
+    "urgenza",
+    "presidio",
+    "temperatura",
+    "stato_sintetico",
+    "azione_suggerita",
+    "promessa_rilevata",
+]
+
+# Deliberately NOT including "proprietario": the temperatura description has said
+# "Temperatura emotiva del proprietario" since T3, and it is not a facts leak.
+_FACTS_WORDS = ("fatti", "ricovero", "dimissione", "animali", "non_menzionato")
+
+_USER_MESSAGE_BEFORE_T10 = (
+    "Fai il triage delle conversazioni WhatsApp qui sotto.\n"
+    "Ora corrente di riferimento: 2026-07-17 12:00 UTC.\n"
+    "Per ogni conversazione restituisci un oggetto che usa il suo numero [n] come "
+    "campo `ref`. Non inventare né riecheggiare identificativi: basta il numero.\n"
+    "\n"
+    "## Conversazioni\n"
+    "[1] Maria Bianchi — canale: whatsapp — presidio: non assegnata\n"
+    "  [2026-07-17 12:00 UTC] CLIENTE: il coniglio non mangia"
+)
+
+
+def _item_schema(*, include_facts: bool) -> dict:
+    schema = build_output_schema(include_facts=include_facts)
+    return schema["properties"]["conversazioni"]["items"]
+
+
+def _all_strings(node) -> list[str]:
+    """Every string anywhere in a schema: keys, enum values and descriptions."""
+    if isinstance(node, dict):
+        return [s for key, value in node.items() for s in [key, *_all_strings(value)]]
+    if isinstance(node, list):
+        return [s for value in node for s in _all_strings(value)]
+    return [node] if isinstance(node, str) else []
+
+
+def test_user_message_is_byte_identical_when_facts_are_off():
+    """Full-string equality, not a couple of `in` checks.
+
+    The natural way to break `_build_user_message` is a conditional
+    `parts.append("")`: the join turns it into one extra newline, which no substring
+    assertion can see.
+    """
+    engine = TriageEngine(FakeClient([]), now=_fixed_now)
+    transcript, _ = serialize_conversations([_conv()])
+
+    assert engine._build_user_message(transcript, None) == _USER_MESSAGE_BEFORE_T10
+
+
+def test_output_schema_off_keeps_the_properties_of_before_in_order():
+    item = _item_schema(include_facts=False)
+
+    assert list(item["properties"]) == _JUDGMENT_PROPERTIES
+    assert item["required"] == _JUDGMENT_PROPERTIES
+
+
+def test_output_schema_defaults_to_the_off_schema():
+    assert build_output_schema() == build_output_schema(include_facts=False)
+
+
+def test_output_schema_off_never_mentions_facts_even_in_a_description():
+    """Three of this project's four prompt regressions name a field description as a
+    cause. A word about the facts leaking into the off schema is the same failure."""
+    haystack = " ".join(_all_strings(build_output_schema())).lower()
+
+    for word in _FACTS_WORDS:
+        assert word not in haystack, f"{word!r} leaked into the flag-off schema"
+
+
+def test_triage_system_excludes_the_facts_block():
+    """The facts section sits AFTER the developer notes on purpose: anywhere earlier
+    and load_triage_system() would swallow it into TRIAGE_SYSTEM in silence."""
+    assert triage_engine._FACTS_START not in TRIAGE_SYSTEM
+    assert triage_engine._FACTS_DATE_PLACEHOLDER not in TRIAGE_SYSTEM
+    assert TRIAGE_SYSTEM.endswith(
+        "Non aggiungere preamboli né riepiloghi di quello che stai per fare. "
+        "Comincia dal contenuto."
+    )
+
+
+# --- T10: the facts block -------------------------------------------------------
+
+
+def _fatti(**over) -> dict:
+    base = dict(
+        ricovero="in_corso",
+        dimissione={"stato": "fissata", "quando": "2026-07-18"},
+        animali=[{"specie": "coniglio", "nome": "Bunny"}],
+        proprietario="Maria Bianchi",
+    )
+    base.update(over)
+    return base
+
+
+def _explode(*args, **kwargs):
+    raise TriageError("blocco fatti rotto")
+
+
+def test_load_facts_block_extracts_its_section():
+    block = load_facts_block()
+
+    assert triage_engine._FACTS_DATE_PLACEHOLDER in block
+    assert "Note sul blocco fatti" not in block
+
+
+def test_load_facts_block_raises_when_the_marker_is_missing(tmp_path):
+    doc = tmp_path / "prompt.md"
+    doc.write_text("## SYSTEM PROMPT (testo da usare)\nciao\n", encoding="utf-8")
+
+    with pytest.raises(TriageError):
+        load_facts_block(doc)
+
+
+def test_facts_off_survives_an_unreadable_facts_block(monkeypatch):
+    """A feature that is off must not be able to prevent a start, so the block is
+    never even read. (The real guarantee is "not loaded at import"; this is its
+    testable stand-in.)"""
+    monkeypatch.setattr(triage_engine, "load_facts_block", _explode)
+    client = _fake_client_returning({"conversazioni": [_entry(1)]})
+
+    result = TriageEngine(client, now=_fixed_now).triage([_conv()])
+
+    assert len(result.conversations) == 1
+    assert result.conversations[0].fatti is None
+
+
+def test_facts_on_fails_loudly_when_the_block_is_missing(monkeypatch):
+    """ENABLE_PROPOSALS is opt-in: falling back to off in silence would make T10
+    mysteriously dead. It fails at construction, not mid-triage."""
+    monkeypatch.setattr(triage_engine, "load_facts_block", _explode)
+
+    with pytest.raises(TriageError):
+        TriageEngine(FakeClient([]), now=_fixed_now, extract_facts=True)
+
+
+def test_facts_block_comes_last_after_the_transcript():
+    """Before the transcript it becomes the lens the model reads every message
+    through — the mechanism of the second tuning's regression."""
+    engine = TriageEngine(FakeClient([]), now=_fixed_now, extract_facts=True)
+    transcript, _ = serialize_conversations([_conv()])
+
+    message = engine._build_user_message(transcript, None)
+
+    assert message.startswith(_USER_MESSAGE_BEFORE_T10)
+    assert message.index("## Conversazioni") < message.index("## Fatti di stato")
+
+
+def test_facts_block_carries_todays_date_in_the_clinic_timezone():
+    """23:30 UTC is already the next day in Rome. "Dimissione oggi" is a same-day
+    rule, so a date resolved on the wrong clock is a proposal on the wrong day."""
+    engine = TriageEngine(
+        FakeClient([]),
+        now=lambda: datetime(2026, 7, 17, 23, 30, tzinfo=timezone.utc),
+        extract_facts=True,
+    )
+    transcript, _ = serialize_conversations([_conv()])
+
+    message = engine._build_user_message(transcript, None)
+
+    assert "Oggi è 2026-07-18" in message
+    assert triage_engine._FACTS_DATE_PLACEHOLDER not in message
+
+
+def test_output_schema_on_appends_fatti_last():
+    item = _item_schema(include_facts=True)
+
+    assert list(item["properties"]) == [*_JUDGMENT_PROPERTIES, "fatti"]
+    assert item["required"] == [*_JUDGMENT_PROPERTIES, "fatti"]
+
+
+def test_facts_schema_is_strict_all_the_way_down():
+    fatti = _item_schema(include_facts=True)["properties"]["fatti"]
+    dimissione, null_branch = fatti["properties"]["dimissione"]["anyOf"]
+
+    assert fatti["additionalProperties"] is False
+    assert fatti["required"] == ["ricovero", "dimissione", "animali", "proprietario"]
+    assert null_branch == {"type": "null"}
+    assert dimissione["additionalProperties"] is False
+    assert dimissione["properties"]["stato"]["enum"] == ["fissata", "avvenuta"]
+    assert fatti["properties"]["animali"]["items"]["additionalProperties"] is False
+
+
+def test_facts_schema_descriptions_avoid_judgment_vocabulary():
+    """The facts must not argue. A description that pulls one way inside the same
+    request as a prompt that pulls the other is how the judgment drifts."""
+    fatti = _item_schema(include_facts=True)["properties"]["fatti"]
+    haystack = " ".join(_all_strings(fatti)).lower()
+
+    for word in ("urgente", "grave", "subito", "priorità", "preoccupat"):
+        assert word not in haystack, f"{word!r} is judgment vocabulary"
+
+
+def test_triage_sends_the_facts_schema_and_the_same_system_prompt():
+    client = _fake_client_returning({"conversazioni": [_entry(1, fatti=_fatti())]})
+    engine = TriageEngine(client, now=_fixed_now, extract_facts=True)
+
+    engine.triage([_conv()])
+
+    call = client.messages.calls[0]
+    item = call["output_config"]["format"]["schema"]["properties"]["conversazioni"]["items"]
+    assert "fatti" in item["properties"]
+    assert call["system"] == TRIAGE_SYSTEM  # the system prompt never moves
+
+
+# --- T10: parsing and degradation -----------------------------------------------
+
+
+def test_parse_builds_fatti():
+    data = {"conversazioni": [_entry(1, fatti=_fatti())]}
+
+    fatti = parse_triage_response(data, {1: _conv()}).conversations[0].fatti
+
+    assert fatti.ricovero is Ricovero.IN_CORSO
+    assert fatti.dimissione.stato is StatoDimissione.FISSATA
+    assert fatti.dimissione.quando == "2026-07-18"
+    assert fatti.animali == (Animale(specie="coniglio", nome="Bunny"),)
+    assert fatti.proprietario == "Maria Bianchi"
+
+
+def test_malformed_fatti_cost_their_facts_not_the_entry():
+    """The triage is the product, the facts are the side dish: they must never be
+    able to make a line disappear from the digest."""
+    data = {"conversazioni": [_entry(1, motivo="il coniglio non mangia", fatti={"ricovero": "boh"})]}
+
+    entry = parse_triage_response(data, {1: _conv()}).conversations[0]
+
+    assert entry.fatti is None
+    assert entry.motivo == "il coniglio non mangia"
+    assert entry.gruppo is Gruppo.IN_CORSO
+
+
+def test_the_malformed_fatti_warning_never_carries_the_payload(caplog):
+    """Facts hold owners' and animals' names, and this line goes to journald."""
+    data = {"conversazioni": [_entry(1, fatti={"ricovero": "boh", "proprietario": "Maria Bianchi"})]}
+
+    with caplog.at_level("WARNING"):
+        parse_triage_response(data, {1: _conv()})
+
+    assert "Maria Bianchi" not in caplog.text
+    assert "ValueError" in caplog.text
+
+
+def test_quando_is_dropped_when_it_is_not_an_iso_date():
+    """PR2 does arithmetic on this field: a half-understood date would mature a
+    proposal on the wrong day and nobody would notice. The stato survives."""
+    dimissione_raw = {"stato": "fissata", "quando": "domani"}
+    data = {"conversazioni": [_entry(1, fatti=_fatti(dimissione=dimissione_raw))]}
+
+    dimissione = parse_triage_response(data, {1: _conv()}).conversations[0].fatti.dimissione
+
+    assert dimissione.stato is StatoDimissione.FISSATA
+    assert dimissione.quando is None
+
+
+def test_fatti_without_a_dimissione_or_animals_are_valid():
+    data = {"conversazioni": [_entry(1, fatti=_fatti(dimissione=None, animali=[]))]}
+
+    fatti = parse_triage_response(data, {1: _conv()}).conversations[0].fatti
+
+    assert fatti.dimissione is None
+    assert fatti.animali == ()
+
+
+def test_an_entry_without_fatti_keeps_them_none():
+    result = parse_triage_response({"conversazioni": [_entry(1)]}, {1: _conv()})
+
+    assert result.conversations[0].fatti is None
