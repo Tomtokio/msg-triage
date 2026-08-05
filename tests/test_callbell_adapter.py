@@ -266,12 +266,36 @@ def test_update_contact_tags_patches_the_whole_list():
     assert call["json"] == {"tags": ["Risolto"]}
 
 
-def test_write_is_refused_on_a_read_only_client():
+def test_update_contact_name_patches_only_the_name():
+    session = FakeSession([FakeResponse({"contact": {"uuid": "c1", "name": "Mario Rossi"}})])
+    client = CallbellClient(
+        "key", session=session, sleep=lambda s: None, throttle=0, allow_writes=True
+    )
+
+    saved = client.update_contact_name("c1", "Mario Rossi")
+
+    assert saved["name"] == "Mario Rossi"
+    call = session.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"].endswith("/contacts/c1")
+    # Only "name": a partial body is what leaves tags/note/assignedUser alone.
+    assert call["json"] == {"name": "Mario Rossi"}
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda client: client.update_contact_tags("c1", []),
+        lambda client: client.update_contact_name("c1", "Mario"),
+    ],
+    ids=["tags", "name"],
+)
+def test_every_write_is_refused_on_a_read_only_client(write):
     session = FakeSession([])
     client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
 
     with pytest.raises(CallbellError):
-        client.update_contact_tags("c1", [])
+        write(client)
 
     assert session.calls == []  # refused before touching the network
 
@@ -373,6 +397,9 @@ def test_build_adapter_wires_from_config():
     adapter = build_adapter(config)
     assert isinstance(adapter, CallbellSourceAdapter)
     # Structural, not documentary: everything wired through build_adapter — the
-    # Telegram bot included — is incapable of writing to Callbell.
+    # Telegram bot included — is incapable of writing to Callbell. Both writes,
+    # so a new one added later cannot quietly escape the guarantee.
     with pytest.raises(CallbellError):
         adapter._client.update_contact_tags("c1", [])
+    with pytest.raises(CallbellError):
+        adapter._client.update_contact_name("c1", "Mario")
