@@ -1,12 +1,16 @@
-"""T7 — Best-effort persistence of a triage run on Supabase (PostgREST).
+"""T7 — Persistence of a triage run on Supabase (PostgREST), plus the raw client.
 
-This module WRITES ONLY. It saves what a run produced so that three things become
-possible later: re-reading past triages (storico), comparing a conversation with its
-previous state (memory, T4 — it queries ``conversation_states`` by ``contact_id``),
-and the tag/proposal lifecycle (T10, whose tables the migration creates empty).
-Reading any of it is not T7's job.
+It saves what a run produced so that three things become possible: re-reading past
+triages (storico), comparing a conversation with its previous state (memory, T4 — it
+queries ``conversation_states`` by ``contact_id``), and the tag/proposal lifecycle
+(T10, which builds :class:`~msg_triage.proposal_store.ProposalStore` on top of the
+:class:`SupabaseStore` below).
 
-Two design rules govern everything here:
+T7 itself only ever wrote. Since T10/PR2 the client also READS — the proposal rules
+need to know what was already proposed and which tags are ours — which is why
+``Accept-Profile`` now travels beside ``Content-Profile`` (see :class:`SupabaseStore`).
+
+Two design rules govern the T7 entry point, :func:`save_triage_run`:
 
 - **Never in the critical path.** Persistence is best-effort: an unreachable or
   refusing Supabase produces a WARNING and nothing else, and the triage is delivered
@@ -175,18 +179,22 @@ class SupabaseError(RuntimeError):
 
 
 class SupabaseStore:
-    """Thin, injectable PostgREST client that inserts rows into the custom schema.
+    """Thin, injectable PostgREST client for the custom schema.
 
     ``session`` is injected so the store is unit-testable with no real network, like
-    :class:`~msg_triage.callbell_adapter.CallbellClient`. The two headers that matter
-    for a CUSTOM schema:
+    :class:`~msg_triage.callbell_adapter.CallbellClient`. The headers that matter for a
+    CUSTOM schema:
 
-    - ``Content-Profile: msg_triage`` — routes writes to the schema. Without it
+    - ``Content-Profile: msg_triage`` — routes WRITES to the schema. Without it
       PostgREST looks in ``public`` and reports a missing table.
-    - ``Prefer: return=minimal`` — we generate the run id ourselves, so there is
-      nothing to read back and no row echoed into a response.
+    - ``Accept-Profile: msg_triage`` — the same thing for READS, and a separate header.
+      A GET carrying only ``Content-Profile`` goes looking in ``public`` and fails in a
+      way that reads like a missing grant. Nothing read before T10/PR2, so nothing had
+      noticed.
+    - ``Prefer`` is per-call, not a constant on the client: it governs what a write
+      returns, and on a GET it is at best noise.
 
-    Both also require ``msg_triage`` to be listed under the project's "Exposed
+    All of it also requires ``msg_triage`` to be listed under the project's "Exposed
     schemas" and the key to be the service_role JWT in legacy ``eyJh...`` form; see
     ``docs/runbook.md`` § E.
     """
@@ -208,20 +216,81 @@ class SupabaseStore:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "Content-Profile": schema,
-            "Prefer": "return=minimal",
+            "Accept-Profile": schema,
         }
 
-    def insert(self, table: str, rows: list[dict]) -> None:
-        """POST ``rows`` into ``table``. Raises :class:`SupabaseError` on failure."""
+    def _send(self, table: str, verb, **kwargs) -> requests.Response:
+        """One PostgREST round-trip: run it, map transport and HTTP failures.
+
+        ``verb`` is the session method itself (``self._session.post`` & co.) rather
+        than a string, so each caller still reads as the HTTP verb it is while the
+        error mapping lives in one place.
+        """
         url = f"{self._base_url}/rest/v1/{table}"
         try:
-            response = self._session.post(
-                url, headers=self._headers, json=rows, timeout=self._timeout
-            )
+            response = verb(url, timeout=self._timeout, **kwargs)
         except requests.RequestException as exc:
             raise SupabaseError(f"{table}: {type(exc).__name__}: {exc}") from exc
         if not 200 <= response.status_code < 300:
             raise SupabaseError(f"{table}: HTTP {response.status_code} — {_error_detail(response)}")
+        return response
+
+    def insert(self, table: str, rows: list[dict]) -> None:
+        """POST ``rows`` into ``table``. Raises :class:`SupabaseError` on failure.
+
+        ``return=minimal``: we generate every id ourselves, so there is nothing to read
+        back and no row echoed into a response.
+        """
+        self._send(
+            table,
+            self._session.post,
+            headers={**self._headers, "Prefer": "return=minimal"},
+            json=rows,
+        )
+
+    @staticmethod
+    def _rows(table: str, response: requests.Response) -> list[dict]:
+        """The JSON list PostgREST promises, or a :class:`SupabaseError`.
+
+        Both failure modes are the same mistake to a caller: a proxy error page and a
+        successful-looking non-list body must not pass for "no rows". Callers of this
+        class catch one exception type, so a bare ``ValueError`` from ``.json()`` would
+        escape straight past them.
+        """
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise SupabaseError(f"{table}: response body was not JSON") from exc
+        if not isinstance(body, list):
+            raise SupabaseError(f"{table}: expected a JSON list, got {type(body).__name__}")
+        return body
+
+    def select(self, table: str, params: dict) -> list[dict]:
+        """GET the rows matching ``params`` (PostgREST filter syntax)."""
+        return self._rows(
+            table, self._send(table, self._session.get, headers=self._headers, params=params)
+        )
+
+    def patch(
+        self, table: str, params: dict, row: dict, *, prefer: str = "return=minimal"
+    ) -> list[dict]:
+        """PATCH the rows matched by ``params``; return them only if ``prefer`` asks.
+
+        The filter is mandatory and refused when empty: PostgREST cheerfully updates
+        the WHOLE table when a PATCH carries none, and there is no undo for that.
+        """
+        if not params:
+            raise SupabaseError(f"{table}: refusing an unfiltered PATCH")
+        response = self._send(
+            table,
+            self._session.patch,
+            headers={**self._headers, "Prefer": prefer},
+            params=params,
+            json=row,
+        )
+        # With return=minimal PostgREST answers 204 with no body at all: asking for JSON
+        # there would raise on the happy path.
+        return self._rows(table, response) if "representation" in prefer else []
 
     def save_run(self, run: dict, states: list[dict]) -> None:
         """Insert the run, then all its states in one bulk insert.

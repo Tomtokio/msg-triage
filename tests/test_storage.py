@@ -21,6 +21,7 @@ from msg_triage.renderers import render_all
 from msg_triage.source_adapter import Conversation, Message, Role
 from msg_triage.storage import (
     SCHEMA,
+    SupabaseError,
     SupabaseStore,
     build_run_record,
     build_state_records,
@@ -114,20 +115,38 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Records every POST and returns queued responses in order."""
+    """Records every call and returns queued responses in order."""
 
     def __init__(self, responses=None, raises=None):
         self._responses = list(responses or [])
         self._raises = raises
         self.calls: list[dict] = []
 
-    def post(self, url, headers=None, json=None, timeout=None):
-        self.calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+    def _record(self, method, url, headers=None, json=None, params=None, timeout=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "json": json,
+                "params": params,
+                "timeout": timeout,
+            }
+        )
         if self._raises is not None:
             raise self._raises
         if self._responses:
             return self._responses.pop(0)
         return FakeResponse()
+
+    def post(self, url, **kwargs):
+        return self._record("POST", url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self._record("GET", url, **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self._record("PATCH", url, **kwargs)
 
 
 # --- is_configured: the feature flag -------------------------------------------
@@ -334,6 +353,64 @@ def test_save_sends_the_custom_schema_headers():
     assert headers["apikey"] == "eyJh-fake"
     assert headers["Authorization"] == "Bearer eyJh-fake"
     assert session.calls[0]["timeout"] > 0  # never hangs the bot
+
+
+# --- The read/patch primitives (T10 builds on these) ---------------------------
+
+
+def _bare_store(session) -> SupabaseStore:
+    config = _config()
+    return SupabaseStore(config.supabase_url, config.supabase_key, session=session)
+
+
+def test_select_sends_accept_profile_and_no_prefer():
+    # Content-Profile routes WRITES; a GET without Accept-Profile goes looking in
+    # `public` and fails like a missing grant. Nothing read before T10, so nothing had
+    # ever tripped over it.
+    session = FakeSession(responses=[FakeResponse(status_code=200, payload=[{"id": 1}])])
+
+    rows = _bare_store(session).select("proposals", {"contact_id": "eq.cb-rossi"})
+
+    assert rows == [{"id": 1}]
+    headers = session.calls[0]["headers"]
+    assert headers["Accept-Profile"] == SCHEMA
+    assert "Prefer" not in headers
+    assert session.calls[0]["params"] == {"contact_id": "eq.cb-rossi"}
+
+
+@pytest.mark.parametrize("payload", [{"message": "nope"}, None])
+def test_select_rejects_anything_that_is_not_a_list_of_rows(payload):
+    # A proxy error page (non-JSON) and a successful-looking object are the same mistake
+    # to a caller: neither may pass for "no rows", and neither may escape as a ValueError.
+    session = FakeSession(responses=[FakeResponse(status_code=200, payload=payload)])
+
+    with pytest.raises(SupabaseError):
+        _bare_store(session).select("proposals", {})
+
+
+def test_patch_refuses_an_unfiltered_update():
+    # PostgREST cheerfully updates the WHOLE table when a PATCH carries no filter.
+    session = FakeSession()
+
+    with pytest.raises(SupabaseError):
+        _bare_store(session).patch("proposals", {}, {"stato": "rifiutata"})
+
+    assert session.calls == []  # refused before the request, not after
+
+
+def test_patch_returns_the_rows_only_when_representation_is_asked():
+    minimal = FakeSession(responses=[FakeResponse(status_code=204)])
+    representation = FakeSession(
+        responses=[FakeResponse(status_code=200, payload=[{"id": "p-1"}])]
+    )
+
+    assert _bare_store(minimal).patch("proposals", {"id": "eq.p-1"}, {"stato": "eseguita"}) == []
+    assert _bare_store(representation).patch(
+        "proposals", {"id": "eq.p-1"}, {"stato": "eseguita"}, prefer="return=representation"
+    ) == [{"id": "p-1"}]
+
+    assert minimal.calls[0]["headers"]["Prefer"] == "return=minimal"
+    assert representation.calls[0]["headers"]["Prefer"] == "return=representation"
 
 
 def test_save_bulk_inserts_all_states_in_one_call():

@@ -113,10 +113,24 @@ Vedi prompt dedicato (prompt-t10-proposte.md). In sintesi: il triage estrae fatt
 stato dal testo (stessa chiamata LLM); regole deterministiche generano PROPOSTE
 (aggiungi/rimuovi tag del set chiuso, rinomina contatto secondo convenzione); ogni
 proposta arriva su Telegram con bottoni ✅/❌; solo alla conferma il codice scrive su
-Callbell. Set chiuso v1: ricoverato / dimissione-oggi / triage-urgente, ognuno con la
-propria regola di ciclo di vita. Tag delle colleghe intoccabili. Controllo di coerenza
-al risveglio delle conversazioni dormienti (anti-fossile). Multi-animale → nome = solo
-proprietario.
+Callbell. Controllo di coerenza al risveglio delle conversazioni dormienti
+(anti-fossile). Multi-animale → nome = solo proprietario.
+
+**Set chiuso v1: `Ricoverato` / `Dimissione oggi` / `Da gestire subito`**, ognuno con la
+propria regola di ciclo di vita. Scritti così, con maiuscole e spazi: li leggono le
+colleghe nella UI di Callbell, non sono identificatori interni. (Il prompt dedicato
+riporta ancora i nomi vecchi `ricoverato / dimissione-oggi / triage-urgente`: sono
+superati, la decisione è questa.) Un tag è "nostro" solo se ha la riga in `system_tags`,
+mai per nome — vedi dev_notes.
+
+**Avanzamento, una PR per concern:**
+- PR0 ✅ — probe della scrittura del nome su Callbell, verificata sul dato reale (2026-08-05).
+- PR1 ✅ — fatti di stato nella stessa unica chiamata LLM, dietro `ENABLE_PROPOSALS`.
+- PR2 ✅ — migration 0002, regole deterministiche (`proposals.py`) e store (`proposal_store.py`):
+  le proposte nascono `pending` su Supabase. Niente consegna, niente scritture su Callbell.
+- PR3 — consegna su Telegram coi bottoni, conferma, esecuzione su Callbell.
+- PR4 — proposte programmate (job) e rete anti-fossile + `/pulizia`.
+
 **Completamento:** le proposte arrivano, i tap eseguono, il DB traccia il ciclo completo.
 **Dipendenze:** T9 (bot sempre attivo), T7 (tabelle proposals + system_tags).
 

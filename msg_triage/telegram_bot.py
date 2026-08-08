@@ -15,6 +15,10 @@ Not wired yet (seams in place, no rework when they land):
   written by T7.
 - T6 audio (TTS): the "vocale" is delivered as text; the single swap point is
   marked ``SEAM T6`` in :func:`_deliver_triage`.
+- T10 proposals: with ``ENABLE_PROPOSALS`` on, a run now WRITES its proposals to
+  Supabase as ``pending`` and delivers none of them. The buttons, the callback
+  handler and the writes to Callbell are PR3; the bot is still structurally unable
+  to write to Callbell (``build_adapter`` grants no ``allow_writes``).
 
 Design: python-telegram-bot v21+ is async, but the pipeline (requests + anthropic)
 is blocking, so the heavy work runs off the event loop via ``asyncio.to_thread``.
@@ -36,6 +40,7 @@ from typing import TYPE_CHECKING
 from msg_triage import telemetry
 from msg_triage.callbell_adapter import CallbellError, build_adapter
 from msg_triage.config import Config
+from msg_triage.proposal_store import build_and_store_proposals
 from msg_triage.renderers import RenderedTriage, render_all
 from msg_triage.source_adapter import Conversation
 from msg_triage.storage import save_triage_run
@@ -351,6 +356,21 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "duration_ms": _elapsed_ms(run_started),
             },
         )
+
+        # T10/PR2: the proposals are BUILT and PERSISTED here, and delivered nowhere —
+        # the buttons arrive in PR3. This spot, before the best-effort save, is where
+        # their delivery will go, so nothing gets reshuffled later.
+        #
+        # Unlike save_triage_run this CAN raise (invariante 3: a proposal we cannot
+        # remember making must not exist), hence the guard. The triage is already out,
+        # so a storage problem is a warning and not the user's problem; in PR3 this
+        # except becomes the "proposte non disponibili in questo run" line.
+        try:
+            await asyncio.to_thread(
+                build_and_store_proposals, config, result, conversations
+            )
+        except Exception as exc:  # noqa: BLE001 - the triage is delivered; this must not undo it
+            logger.warning("Proposte T10 non create (%s)", type(exc).__name__)
 
         # T7: best-effort, after delivery, off the event loop. Cannot raise.
         await asyncio.to_thread(

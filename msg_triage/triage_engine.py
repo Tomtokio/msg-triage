@@ -52,7 +52,11 @@ _FACTS_START = "## BLOCCO FATTI DI STATO (testo da usare — T10)"
 _FACTS_END = "## Note sul blocco fatti (NON parte del prompt)"
 # Substituted with today's date in the clinic's timezone; see load_facts_block().
 _FACTS_DATE_PLACEHOLDER = "{oggi}"
-_CLINIC_TZ = "Europe/Rome"
+# Public because the proposal rules (T10/PR2) must resolve "today" against the SAME
+# clock the model was told to use: the facts block says "Oggi è <date>, fuso
+# Europe/Rome", and a rule that computed "today" in UTC would disagree with it for two
+# hours around midnight -- exactly the window where a same-day rule gets it wrong.
+CLINIC_TZ = "Europe/Rome"
 
 
 class TriageError(RuntimeError):
@@ -740,7 +744,7 @@ class TriageEngine:
         is precisely a same-day rule. The local date lives here, inside the
         flag-gated block, so the shared part of the message stays untouched.
         """
-        today = self._now().astimezone(ZoneInfo(_CLINIC_TZ)).strftime("%Y-%m-%d")
+        today = self._now().astimezone(ZoneInfo(CLINIC_TZ)).strftime("%Y-%m-%d")
         return self._facts_block.replace(_FACTS_DATE_PLACEHOLDER, today)
 
     @staticmethod

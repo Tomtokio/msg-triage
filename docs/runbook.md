@@ -183,6 +183,14 @@ Schema: **`msg_triage`**. File: [`migrations/0001_msg_triage_schema.sql`](../mig
    `migrations/0001_msg_triage_schema.sql` → Run. Gira come ruolo `postgres`. Crea schema,
    quattro tabelle, indici, RLS attiva senza policy e i grant per `service_role`.
 
+   Poi, **nello stesso modo e nell'ordine**,
+   [`migrations/0002_proposals_lifecycle.sql`](../migrations/0002_proposals_lifecycle.sql)
+   (T10/PR2): aggiunge `proposals.decided_at`, il vincolo di unicità
+   `(contact_id, tag)` su `system_tags` e l'indice del ripescaggio. Le due tabelle di T10
+   sono vuote finché non si accende `ENABLE_PROPOSALS`, quindi si applica senza rischio —
+   ma va applicata **prima** che il codice giri, o il primo `/triage` a flag acceso
+   fallisce su `decided_at` (`PGRST204`). Vedi § G.
+
 2. **Exposed schemas.** Settings → API → Data API → **Exposed schemas**: aggiungere
    `msg_triage` a fianco di quelli già presenti (non sostituirli), Save. Senza questo passo
    lo schema custom non esiste per PostgREST.
@@ -342,6 +350,107 @@ sudo journalctl -u msg-triage -n 100 | grep -i telemetry
 **Cosa NON finisce nella telemetria:** nomi di clienti, numeri di telefono, testo dei
 messaggi, testo del digest, prompt e risposte del modello. Solo id di riferimento,
 conteggi, durate e codici di errore — vedi `CLAUDE.md § Telemetria`.
+
+---
+
+## G. T10 — proposte organizzative (`ENABLE_PROPOSALS`)
+
+**Stato a PR2: le proposte NASCONO sul database e non arrivano da nessuna parte.** Niente
+messaggi su Telegram, niente bottoni, e soprattutto **niente scritture su Callbell** — il
+bot resta strutturalmente incapace di scriverci (`build_adapter()` non concede
+`allow_writes`). Consegna ed esecuzione sono PR3.
+
+Il flag accende due cose insieme: il blocco *fatti di stato* nella singola chiamata LLM
+(PR1) e le *regole deterministiche* che ne ricavano le proposte (PR2). Serve **anche**
+Supabase vero: senza database non c'è idempotenza — un rifiuto verrebbe dimenticato e la
+stessa proposta tornerebbe a ogni run — quindi il codice preferisce non proporre niente e
+lo dice una volta nel log.
+
+### I tre tag gestiti
+
+`Ricoverato` · `Dimissione oggi` · `Da gestire subito` — scritti così, con le maiuscole e
+gli spazi che vedi, perché li leggono le colleghe nella UI di Callbell.
+
+> **Un tag è "nostro" solo se esiste la sua riga in `msg_triage.system_tags`, mai per
+> nome.** `Ricoverato` è byte-identico a quello che le colleghe usano a mano: il nome non
+> distingue niente. Conseguenza accettata: le loro istanze la regola semantica non le
+> tocca mai; ci arriverà solo la rete dei 14 giorni (PR4).
+
+### Accendere
+
+1. La migration `0002` applicata (§ E, passo 1). Senza, il primo run fallisce.
+2. Nel `.env` sul VPS (come `msgtriage`, file `~/msg-triage/.env`, permessi 0600):
+   `ENABLE_PROPOSALS=true`, con `SUPABASE_URL`/`SUPABASE_KEY` veri.
+3. `sudo systemctl restart msg-triage` — la config si legge solo allo startup.
+
+### Prima di accendere: il giro a secco delle regole
+
+`ricovero` e `dimissione` non sono mai stati esercitati sul dato reale. Prima di lasciare
+le regole vicino al database, si guardano girare sui fatti veri — **senza scrivere niente,
+da nessuna parte**:
+
+```
+.venv/bin/python scripts/smoke_triage.py --real 6 --facts --proposals
+```
+
+Stampa le proposte che nascerebbero, con payload e motivo. Cosa cercare: nessun nome
+inventato, nessuna data uscita dal nulla, `Ricoverato` solo dove qualcuno ha scritto
+davvero di una degenza. Le rimozioni di `Ricoverato` **non possono comparire qui** per
+costruzione (richiedono una riga in `system_tags`, che il dry-run non legge).
+
+### Verifica dopo il primo `/triage` a flag acceso
+
+Nei log deve comparire la riga coi soli conteggi (mai nomi, mai `contact_id`):
+
+```
+sudo journalctl -u msg-triage -n 80 | grep -i 'proposte t10'
+```
+
+Poi nella SQL Editor:
+
+```sql
+select created_at, contact_id, tipo, payload, motivo, stato, matures_at
+from msg_triage.proposals
+where stato = 'pending'
+order by created_at desc;
+```
+
+> **Il test di idempotenza va fatto a pochi minuti di distanza, non a ore.** Un secondo
+> `/triage` sulla **stessa finestra** non deve creare nuove righe: è la prova che la
+> proposta già `pending` blocca il duplicato. Ma se nel frattempo la finestra si è spostata
+> e pesca conversazioni diverse, righe nuove sono l'esito **corretto** e il test non
+> dimostra niente. Due giri ravvicinati, stessa `/triage N`, e si confronta il conteggio:
+> ```sql
+> select count(*) from msg_triage.proposals where created_at > now() - interval '30 minutes';
+> ```
+
+Su Callbell, infine: **nessun tag cambiato, nessun nome cambiato.** A PR2 deve essere così
+per costruzione, non per fortuna.
+
+### Il censimento dei `Ricoverato` che restano fuori
+
+Da fare una volta, col flag acceso e qualche run alle spalle: quanti `Ricoverato` esistenti
+sono delle colleghe e quindi la regola semantica non li toglierà mai. È il numero che serve
+per decidere se valga la pena "adottarli" in `system_tags` con una migrazione una tantum,
+invece di lasciarli alla rete dei 14 giorni.
+
+```sql
+select count(*) from msg_triage.system_tags where tag = 'Ricoverato';
+```
+
+confrontato col totale dei contatti che portano il tag su Callbell (il dry-run di
+`scripts/cleanup_stale_tags.py` lo stampa: `=== TAG 'Ricoverato' — N contatti dal filtro ===`).
+Se la differenza è grossa, se ne riparla; finché non c'è il numero, la scelta è un'opinione.
+
+> ⚠️ **`scripts/cleanup_stale_tags.py` in modalità `--esegui-davvero` non va più lanciato
+> con T10 vivo**: strapperebbe tag di sistema scavalcando le proposte, e lascerebbe le
+> righe di `system_tags` a dire il falso. Il dry-run resta utile come censimento.
+
+### Spegnere
+
+`ENABLE_PROPOSALS=false` + restart. Il triage torna identico a prima, byte per byte. Le
+righe `pending` restano dove sono e non fanno niente: nessuna di esse ha mai toccato
+Callbell.
 
 ---
 

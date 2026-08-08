@@ -36,6 +36,27 @@ Non saltare queste pause. Mai.
 - **Paletto etico**: il triage descrive lo stato delle conversazioni, non giudica l'operato
   delle colleghe. Vincolo non negoziabile, vedi dev_notes.
 
+## T10 — tag di sistema e proposte (dietro `ENABLE_PROPOSALS`, default OFF)
+- Set chiuso, scritto **esattamente così** perché lo leggono le colleghe nella UI di
+  Callbell: `Ricoverato` / `Dimissione oggi` / `Da gestire subito`. Mai `strip()`, mai
+  `lower()`, confronto byte per byte. (`docs/prompts/prompt-t10-proposte.md` riporta ancora
+  i nomi vecchi `ricoverato / dimissione-oggi / triage-urgente`: sono superati.)
+- **Un tag è "nostro" solo se esiste la riga in `msg_triage.system_tags`, mai per nome.**
+  `Ricoverato` è byte-identico a quello che le colleghe usano a mano: il nome non distingue
+  niente. `system_tags` è lo stato corrente, non uno storico — la storia sta in `proposals`.
+- **Il modello non decide e non scrive mai.** Estrae i fatti; le regole deterministiche
+  (`msg_triage/proposals.py` — pure: niente rete, niente config, `now` iniettato) li
+  traducono in proposte tipizzate.
+- **Nessuna proposta esiste se non è persistita**: l'idempotenza vive nel DB. Perciò
+  `proposal_store.py` NON è fail-silent come `storage.save_triage_run`: i suoi errori si
+  propagano. E il flag da solo non basta — senza un Supabase vero non si producono proposte.
+- Un tag non si rimuove **mai** perché è passato del tempo. Le maturazioni a calendario
+  cadono alle 07:00 Europe/Rome; «oggi» è sempre quello di Roma, mai quello di UTC.
+- **Stato: PR2.** Le proposte nascono `pending` sul DB e non arrivano da nessuna parte:
+  niente Telegram, niente scritture su Callbell. Il bot resta *strutturalmente* incapace di
+  scrivere (`build_adapter()` non concede `allow_writes`). Con PR3 quello cambia: quando
+  succederà, questo punto e il fatto n.7 qui sotto vanno riscritti.
+
 ## Ambiente
 - Python 3.12+ (`requires-python >= 3.12`)
 - `uv` per le dipendenze. Nuovo workspace Conductor = venv da ricreare:
