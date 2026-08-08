@@ -355,6 +355,69 @@ def test_triage_command_saves_the_run_after_delivering_it(monkeypatch):
     assert saved["replies_so_far"] == 4
 
 
+def test_triage_command_builds_proposals_after_delivery_and_before_the_save(monkeypatch):
+    result = _result(_triage_entry())
+    rendered = render_all(result)
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (result, rendered, ["conv"]),
+    )
+    message = _FakeMessage()
+    # One shared list, so the ORDER is asserted and not just the calls: PR3 delivers the
+    # proposals from this spot, and persistence must stay behind them.
+    order: list[str] = []
+    built: list[dict] = []
+
+    def fake_build(config, built_result, conversations):
+        order.append("proposals")
+        built.append({"result": built_result, "replies_so_far": len(message.replies)})
+        return []
+
+    def fake_save(config, saved, rendered_out, conversations, *, window_hours):
+        order.append("save")
+        return True
+
+    monkeypatch.setattr(telegram_bot, "build_and_store_proposals", fake_build)
+    monkeypatch.setattr(telegram_bot, "save_triage_run", fake_save)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert order == ["proposals", "save"]
+    assert built[0]["result"] is result
+    # Never in the critical path either: the three formats were already out.
+    assert built[0]["replies_so_far"] == 4
+
+
+def test_a_failing_proposal_step_does_not_undo_the_triage(monkeypatch, caplog):
+    result = _result(_triage_entry())
+    rendered = render_all(result)
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (result, rendered, ["conv"]),
+    )
+
+    def boom(config, result, conversations):
+        raise RuntimeError("PostgREST è giù")
+
+    monkeypatch.setattr(telegram_bot, "build_and_store_proposals", boom)
+    message = _FakeMessage()
+    saves = _record_saves(monkeypatch, message)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
+
+    with caplog.at_level("WARNING", logger="msg_triage.telegram_bot"):
+        asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    # The triage is already delivered and the run still saves: a storage problem with
+    # the proposals is a warning, not the user's problem. The message never travels.
+    assert len(message.replies) == 4
+    assert len(saves) == 1
+    assert "RuntimeError" in caplog.text
+    assert "PostgREST" not in caplog.text
+
+
 def test_triage_command_reports_pipeline_error(monkeypatch):
     def boom(config, hours, *, job_id=None):
         raise TriageError("il modello ha rifiutato la richiesta")

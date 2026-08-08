@@ -13,17 +13,25 @@ The T10 A/B, which is the acceptance gate for the facts block — same window, t
 runs, and gruppo/urgenza/presidio/temperatura/motivo must not move between them:
     .venv/bin/python scripts/smoke_triage.py --real 6 --no-facts   # the reference
     .venv/bin/python scripts/smoke_triage.py --real 6 --facts      # twice, minutes apart
+
+The T10/PR2 dry-run: run the deterministic rules over the facts and print the proposals
+they WOULD create, without touching Supabase and without writing anything anywhere.
+This is the gate before letting the rules near the database, because `ricovero` and
+`dimissione` have never been exercised on real data:
+    .venv/bin/python scripts/smoke_triage.py --real 6 --facts --proposals
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from msg_triage.config import ConfigError, load_config
 from msg_triage.logging_setup import setup_logging
+from msg_triage.proposals import build_proposals
 from msg_triage.renderers import render_all
 from msg_triage.source_adapter import Conversation, Message, Role
 from msg_triage.triage_engine import TriageResult, build_triage_engine, extract_species
@@ -135,6 +143,53 @@ def _print_rendered(result: TriageResult) -> None:
     print(f"\n[vocale: {len(rendered.vocal_text)} caratteri]")
 
 
+def _print_proposals(
+    result: TriageResult, conversations: list[Conversation], *, facts_on: bool
+) -> None:
+    """T10/PR2 dry-run: what the deterministic rules would propose, and nothing else.
+
+    No Supabase, no Callbell, no row written: ``build_proposals`` is pure, so it runs
+    here with an empty history and no system tags. Both emptinesses have a visible
+    consequence, printed below rather than left for someone to rediscover:
+
+    - with no ``system_tags`` the ``Ricoverato`` REMOVALS cannot appear at all — the
+      rule requires a row proving we applied that tag;
+    - with no past decisions nothing is filtered out, so this is the full unfiltered
+      output of the rules, which is exactly what you want to read by eye.
+    """
+    names = {convo.contact_id: convo.name for convo in conversations}
+    proposals = build_proposals(
+        result.conversations,
+        conversations,
+        system_tags={},
+        decisions=(),
+        now=datetime.now(timezone.utc),
+    )
+
+    print(f"\n========== PROPOSTE (dry-run, {len(proposals)}) ==========")
+    if not facts_on:
+        print(
+            "⚠️  fatti SPENTI: solo la regola di «Da gestire subito» può scattare "
+            "(le altre leggono i fatti). Rilancia con --facts."
+        )
+    for proposal in proposals:
+        nome = names.get(proposal.contact_id) or "(senza nome)"
+        matura = (
+            proposal.matures_at.isoformat() if proposal.matures_at else "subito"
+        )
+        print(f"\n  [{proposal.tipo.value}] {nome} ({proposal.contact_id})")
+        print(f"      payload: {json.dumps(proposal.payload, ensure_ascii=False)}")
+        print(f"      motivo:  {proposal.motivo}")
+        print(f"      matura:  {matura}")
+    if not proposals:
+        print("  (nessuna)")
+    print(
+        "\n  Nota: senza system_tags le rimozioni di «Ricoverato» non possono "
+        "comparire qui, per costruzione. Niente è stato scritto: né su Supabase, "
+        "né su Callbell."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -152,6 +207,12 @@ def main() -> int:
         default=None,
         help="force the T10 facts extraction on (--facts) or off (--no-facts); "
         "default follows ENABLE_PROPOSALS. Use both, on the same window, for the A/B",
+    )
+    parser.add_argument(
+        "--proposals",
+        action="store_true",
+        help="run the T10 deterministic rules over the facts and print the proposals "
+        "they would create. Dry-run: nothing is written to Supabase or Callbell",
     )
     args = parser.parse_args()
 
@@ -179,6 +240,8 @@ def main() -> int:
     result = engine.triage(conversations)
     _print_result(result, facts_on=facts_on)
     _print_rendered(result)
+    if args.proposals:
+        _print_proposals(result, conversations, facts_on=facts_on)
     return 0
 
 

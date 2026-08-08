@@ -134,6 +134,35 @@ scripts/probe_rename.py, nove verifiche tutte passate).
   rischio sullo stesso contatto. Toglie solo i tag visti in discovery: uno aggiunto da una
   collega nel frattempo non è mai stato misurato sulla soglia, quindi non si tocca.
 
+## T10 — i tag di sistema e l'invariante di `system_tags`
+- Il set chiuso gestito dal sistema è `Ricoverato` / `Dimissione oggi` / `Da gestire subito`,
+  scritti esattamente così: li leggono le colleghe nella UI di Callbell, non sono
+  identificatori interni. Mai `strip()`, mai `lower()`, mai confronto case-insensitive coi
+  tag di un contatto (stessa disciplina di TARGET_TAGS).
+- **Un tag è "nostro" solo se esiste la riga in `msg_triage.system_tags`, MAI per nome.**
+  `Ricoverato` è byte-identico a quello che le colleghe usano a mano (~50 contatti al
+  censimento del 2026-08-04): il nome non distingue niente. La migration 0002 lo mette nero
+  su bianco col vincolo `unique (contact_id, tag)` — `system_tags` è **lo stato corrente**
+  dei tag che abbiamo messo noi, non uno storico: la storia sta in `proposals`, riga per riga
+  col suo motivo e il suo esito.
+- Conseguenza ACCETTATA, non ignorata: un `Ricoverato` messo a mano da una collega non viene
+  mai rimosso dalla regola semantica. Ci arriva solo la rete anti-fossile dei 14 giorni.
+- **Un tag non si rimuove MAI perché è passato del tempo.** Una degenza lunga con la chat
+  silente deve tenere il suo tag: per questo `fatti.ricovero` ha tre valori e non è un
+  booleano — `non_menzionato` non è "dimesso", è "in questa finestra non se n'è parlato".
+- Le rimozioni a calendario (`Dimissione oggi` il giorno dopo, `Da gestire subito` a 48 h)
+  nascono **alla conferma dell'aggiunta**, non nello stesso run che propone l'aggiunta: una
+  rimozione programmata di un tag che potrebbe non essere mai applicato sarebbe una riga da
+  interpretare, senza uno stato onesto da darle se la proposta viene ignorata.
+- Tutte le maturazioni a calendario cadono alle **07:00 Europe/Rome** del giorno dopo, da un
+  unico helper. Mezzanotte farebbe maturare nel cuore della notte una cosa che si guarda la
+  mattina, e due convenzioni orarie per due regole gemelle si pagano mesi dopo.
+- «Oggi» è sempre quello di Roma, mai quello di UTC: è la stessa data che il blocco fatti dà
+  al modello, e `Dimissione oggi` è precisamente una regola same-day.
+- Tutto ciò che arriva dal modello ed entra in un'aritmetica (una data di maturazione) o in
+  una stringa scritta su un record vero (un nome contatto) passa prima da un controllo di
+  plausibilità. Un valore che non riconosciamo produce NESSUNA proposta, mai una sbagliata.
+
 ## Anti-pattern (NON fare)
 - NON usare webhook in v0. Pull a comando.
 - NON esporre chiavi lato client. Tutto sul backend Hetzner.
