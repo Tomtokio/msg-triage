@@ -562,7 +562,20 @@ def build_proposals(
         convo = by_contact.get(entry.contact_id)
         if convo is None:
             # Cannot happen: contact_id is filled from the source, never by the model.
-            # Skipping costs one conversation's proposals, not the run.
+            # Skipping costs one conversation's proposals, not the run -- but skipping
+            # SILENTLY would make this the only way to reach zero proposals leaving no
+            # trace anywhere, and "cannot happen" is exactly when that bill comes due.
+            #
+            # The contact_id belongs in the line. The ban on it in CLAUDE.md is about
+            # TELEMETRY metadata, which leaves this machine and lands in a dashboard;
+            # this is journald, where the same id is already written to `proposals` on
+            # Supabase anyway. Without it the warning says something is wrong and
+            # nothing about which conversation to go and look at.
+            logger.warning(
+                "Voce di triage senza conversazione corrispondente (contact_id %s); "
+                "saltata: nessuna proposta per questa conversazione",
+                entry.contact_id,
+            )
             continue
 
         candidates = _tag_proposals(

@@ -10,6 +10,7 @@ data. That is what ``scripts/smoke_triage.py --facts --proposals`` is for.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -485,14 +486,17 @@ def test_ogni_conversazione_porta_le_sue_proposte():
     }
 
 
-def test_una_voce_senza_conversazione_viene_saltata_senza_far_cadere_le_altre():
+def test_una_voce_senza_conversazione_viene_saltata_senza_far_cadere_le_altre(caplog):
     # Non può succedere (il contact_id viene dalla sorgente), ma se succedesse deve
-    # costare quella conversazione, non il run.
+    # costare quella conversazione, non il run. E deve lasciare traccia: è l'unico modo
+    # di arrivare a zero proposte senza che nulla, da nessuna parte, lo dica.
     orfana = _entry(contact_id="cb-orfana", gruppo=Gruppo.SUBITO)
     buona = _entry(contact_id="cb-2", nome="Bianchi", gruppo=Gruppo.SUBITO)
 
-    proposals = build_proposals(
-        [orfana, buona], [_convo(buona)], system_tags={}, decisions=(), now=NOW
-    )
+    with caplog.at_level(logging.WARNING, logger="msg_triage.proposals"):
+        proposals = build_proposals(
+            [orfana, buona], [_convo(buona)], system_tags={}, decisions=(), now=NOW
+        )
 
     assert [p.contact_id for p in proposals] == ["cb-2"]
+    assert "cb-orfana" in caplog.text
