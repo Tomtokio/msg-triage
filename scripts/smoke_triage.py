@@ -143,6 +143,28 @@ def _print_rendered(result: TriageResult) -> None:
     print(f"\n[vocale: {len(rendered.vocal_text)} caratteri]")
 
 
+def _format_rule_inputs(entry, convo: Conversation | None) -> list[str]:
+    """What the rules READ for one entry — not a re-derived verdict on why they stayed put.
+
+    Restating "nothing fired because X" here would mean a second copy of the rules, free
+    to drift from the real ones and to lie with confidence. Printing their inputs cannot:
+    the two gates of the ``Ricoverato`` add are ``fatti.ricovero`` and the contact's tags,
+    so both are on screen and the reader concludes.
+
+    ``tags`` goes through ``repr()`` deliberately. The T10 set is compared byte for byte,
+    so a trailing space or a lowercase initial is the whole difference between a proposal
+    and a silence — and printed plain, both look exactly like the tag they are not.
+    """
+    if convo is None:
+        return ["voce senza conversazione corrispondente: saltata prima delle regole"]
+    fatti = (
+        "fatti assenti (solo «Da gestire subito» poteva scattare)"
+        if entry.fatti is None
+        else _format_fatti(entry.fatti)
+    )
+    return [f"gruppo={entry.gruppo.value}  {fatti}", f"tag sul contatto: {convo.tags!r}"]
+
+
 def _print_proposals(
     result: TriageResult, conversations: list[Conversation], *, facts_on: bool
 ) -> None:
@@ -156,6 +178,11 @@ def _print_proposals(
       rule requires a row proving we applied that tag;
     - with no past decisions nothing is filtered out, so this is the full unfiltered
       output of the rules, which is exactly what you want to read by eye.
+
+    Every entry that earned NOTHING then gets its inputs printed. A zero used to be
+    unfalsifiable — the contact's tags appear nowhere else in this output, so a tag
+    already in place produced a silence indistinguishable from a broken rule, and the
+    difference had to be argued rather than read.
     """
     names = {convo.contact_id: convo.name for convo in conversations}
     proposals = build_proposals(
@@ -183,6 +210,17 @@ def _print_proposals(
         print(f"      matura:  {matura}")
     if not proposals:
         print("  (nessuna)")
+
+    by_contact = {convo.contact_id: convo for convo in conversations}
+    earned = {proposal.contact_id for proposal in proposals}
+    silent = [e for e in result.conversations if e.contact_id not in earned]
+    if silent:
+        print("\n  Cosa hanno letto le regole sulle voci rimaste senza proposta:")
+        for entry in silent:
+            print(f"\n    {entry.nome} ({entry.contact_id})")
+            for line in _format_rule_inputs(entry, by_contact.get(entry.contact_id)):
+                print(f"        {line}")
+
     print(
         "\n  Nota: senza system_tags le rimozioni di «Ricoverato» non possono "
         "comparire qui, per costruzione. Niente è stato scritto: né su Supabase, "
