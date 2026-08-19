@@ -81,6 +81,27 @@ loro lavoro, cambierebbe il clima. Inserire questo vincolo nero su bianco nel sy
   assignedUser, source, channel{uuid,title,type}, note. Messaggio: text, status, uuid, from,
   to, createdAt, channel.
 
+## Le due viste di un contatto (VERIFICATO su dato reale, 2026-08-15)
+Il formato neutro legge `name` e `tags` DALLA LISTA (`iter_contacts()` → `_build_conversation`),
+e su quel `tags` passa il gate di ogni aggiunta di tag T10 («il contatto ha già `Ricoverato`?»).
+Un triage aveva mostrato un nome che la `GET /contacts/:uuid` dello stesso uuid scriveva
+diverso: se le due viste divergono sul nome possono divergere sui tag, e allora T10 decide
+sulla vista sbagliata. Accertato con scripts/probe_contact_view.py su UN contatto — proprio
+quello che aveva dato il sospetto, che è il caso che conta.
+- **Le due viste coincidono su TUTTI i campi**, `name` e `tags` inclusi: `differing_fields()`
+  è tornato vuoto. Il confronto è sull'unione delle chiavi, quindi un campo che una vista
+  omette conterebbe come divergenza — e non ce n'è.
+- **Il nome discordante era una rinomina avvenuta fra le due letture**, non una divergenza
+  strutturale fra le viste. La lista non è una copia stantia con un suo ciclo di aggiornamento.
+- Corollario che sblocca PR3: **`convo.tags` letto dalla lista è una base affidabile** per il
+  gate delle aggiunte. Niente `GET /contacts/:uuid` per contatto: una chiamata a contatto
+  contro una pagina intera per richiesta, pagata per una freschezza che non risulta esistere.
+- Cosa NON è escluso: il tempo che passa fra la lettura della lista e la scrittura alla
+  conferma del tap (minuti o ore, in PR3). Quella è freschezza al momento della scrittura ed è
+  una domanda diversa: qui cade il difetto STRUTTURALE, non la deriva TEMPORALE.
+- Portata: un contatto, un momento. Un secondo caso discordante non smentirebbe questo fatto,
+  ma varrebbe un altro giro di probe prima di trattare la coincidenza come regola generale.
+
 ## Scrittura su Callbell (VERIFICATO su dato reale, 2026-08-01 e 2026-08-05)
 Accertato con probe manuali su contatti veri prima di scrivere una riga di codice, perché
 la scrittura è distruttiva e irreversibile. Vale per T10, non solo per la pulizia una tantum.

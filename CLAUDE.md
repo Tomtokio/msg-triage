@@ -106,12 +106,13 @@ nei punti caldi: `_window_messages` (per messaggio), `CallbellClient._get`/`_pag
 (per pagina HTTP), i loop per-entry dei renderer. E non aggiungere un handler catch-all al
 bot per intercettare il polling: romperebbe il silenzio verso gli utenti non autorizzati.
 
-## Fatti Callbell verificati sul dato reale (2026-07-16)
+## Fatti Callbell verificati sul dato reale (2026-07-16 e 2026-08-15)
 1. Paginazione: envelope `meta: {page, pages}` — iterare finché `page < pages` (NON `data["pagination"]["nextPage"]`).
 2. Marcatura in/out: campo messaggio `status` — `received`=cliente, `sent`=operatore, `note`=nota (NON confronto `from`/telefono).
 3. Telefono del contatto = `phoneNumber`; `assignedUser` (email o null) = segnale PRESIDIO nel formato neutro.
 4. Note di sistema (`status` note, senza `uuid`, `from == to`) distinte dalle note scritte dalle colleghe.
 5. `/contacts` ~332 pagine, ordinato per attività: la finestra temporale è il filtro primario, non paginare tutto.
+6. **Lista `/contacts` e `GET /contacts/:uuid` coincidono** (`name`, `tags`, tutti i campi): un nome discordante è una rinomina fra le due letture, non una divergenza fra le viste. Quindi `convo.tags` dalla lista è base affidabile per il gate T10. Verificato 2026-08-15 con `scripts/probe_contact_view.py`, su un contatto.
 Vedi `docs/dev_notes.md` per il dettaglio.
 
 ## Fatti Callbell sulla SCRITTURA, verificati sul dato reale (2026-08-01 e 2026-08-05)
