@@ -16,6 +16,11 @@ hand: the list gives a whole page in one request, the GET costs one call per con
 "fresher" is worth paying for only if the two actually differ. What it settles is whether
 they differ at all, and how widely.
 
+Esito (2026-08-15): girato sul contatto che aveva dato il sospetto — le due viste coincidono
+su tutti i campi, ``name`` e ``tags`` inclusi. Quel nome discordante era una rinomina avvenuta
+fra le due letture, non una divergenza strutturale, e la lista resta la base di ``convo.tags``.
+Il dettaglio sta in docs/dev_notes.md, "Le due viste di un contatto".
+
 Read-only by construction: the client is built without ``allow_writes``, so a write here is
 impossible rather than merely unintended.
 
