@@ -366,6 +366,15 @@ Il path di lettura resta incapace di scrivere: `build_adapter()` e `build_read_c
 concedono `allow_writes`. L'unica porta è `build_write_client()`, e la apre solo
 `msg_triage/proposal_executor.py` dopo un tap confermato su una proposta che esiste sul DB.
 
+> ⚠️ **Regola aperta: nessun ✅ su una proposta `Ricoverato`, per ora.** Il fatto `ricovero`
+> non è mai stato esercitato sul dato reale (l'A/B del 06/08 non lo copriva, e da quando il
+> flag è acceso non ne è ancora nata una), e `Ricoverato` è l'unico tag che non si toglie mai
+> a tempo: messo per sbaglio resta lì. Tutto il resto si può tappare — ❌ non scrive niente,
+> una rinomina si disfa rinominando indietro, `Da gestire subito` e `Dimissione oggi` hanno
+> la loro rimozione programmata. Quando la prima proposta `Ricoverato` arriva, si legge senza
+> toccare i bottoni: è quello l'A/B. Contesto in `docs/triage_system_prompt.md`, ultime "Note
+> per lo sviluppatore".
+
 ### Come si comporta, in pratica
 
 - Dopo i tre messaggi del triage arriva **una proposta per messaggio**, con ✅ Applica /
