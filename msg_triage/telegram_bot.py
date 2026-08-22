@@ -15,10 +15,13 @@ Not wired yet (seams in place, no rework when they land):
   written by T7.
 - T6 audio (TTS): the "vocale" is delivered as text; the single swap point is
   marked ``SEAM T6`` in :func:`_deliver_triage`.
-- T10 proposals: with ``ENABLE_PROPOSALS`` on, a run now WRITES its proposals to
-  Supabase as ``pending`` and delivers none of them. The buttons, the callback
-  handler and the writes to Callbell are PR3; the bot is still structurally unable
-  to write to Callbell (``build_adapter`` grants no ``allow_writes``).
+
+T10 (``ENABLE_PROPOSALS``, default off): after the three formats a run delivers every
+ripe pending proposal, one message each with ✅/❌. A tap claims the row in the database
+— that is the double-tap defence — and only ✅ reaches Callbell, through
+:mod:`msg_triage.proposal_executor`. The fetch path is still structurally read-only:
+``build_adapter`` grants no ``allow_writes``, and ``build_write_client`` is built here
+only inside the confirmed branch of the callback.
 
 Design: python-telegram-bot v21+ is async, but the pipeline (requests + anthropic)
 is blocking, so the heavy work runs off the event loop via ``asyncio.to_thread``.
@@ -31,19 +34,37 @@ the pure helpers) needs no telegram install and stays light.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import math
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from msg_triage import telemetry
-from msg_triage.callbell_adapter import CallbellError, build_adapter
+from msg_triage.callbell_adapter import (
+    CallbellError,
+    build_adapter,
+    build_read_client,
+    build_write_client,
+)
 from msg_triage.config import Config
-from msg_triage.proposal_store import build_and_store_proposals
-from msg_triage.renderers import RenderedTriage, render_all
+from msg_triage.proposal_executor import (
+    ExecutionOutcome,
+    execute,
+    load_deliverable_with_names,
+)
+from msg_triage.proposal_store import (
+    ProposalStore,
+    build_and_store_proposals,
+    build_proposal_store,
+    row_to_stored,
+)
+from msg_triage.proposals import StatoProposta
+from msg_triage.renderers import RenderedTriage, render_all, render_proposal
 from msg_triage.source_adapter import Conversation
-from msg_triage.storage import save_triage_run
+from msg_triage.storage import SupabaseError, save_triage_run
 from msg_triage.triage_engine import TriageError, TriageResult, build_triage_engine
 
 if TYPE_CHECKING:  # annotations only — no runtime telegram dependency here
@@ -58,6 +79,12 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 # /triage window bounds. Default mirrors the adapter's default window.
 DEFAULT_WINDOW_HOURS = 6.0
 _MAX_WINDOW_HOURS = 168.0  # one week: a sane upper bound for the argument
+
+# T10 proposal buttons. Telegram caps callback_data at 64 bytes; "t10:ok:" plus a uuid4
+# is 43, so the proposal id travels whole and nothing has to be looked up by position.
+CALLBACK_PREFIX = "t10"
+CALLBACK_OK = "ok"
+CALLBACK_NO = "no"
 
 
 # --- Pure helpers (sync, no network, no async — the testable core) -------------
@@ -150,6 +177,29 @@ def _elapsed_ms(since: float) -> int:
     return int((time.monotonic() - since) * 1000)
 
 
+def build_callback_data(action: str, proposal_id: str) -> str:
+    """The payload behind a ✅/❌ button: ``t10:ok:<id>``."""
+    return f"{CALLBACK_PREFIX}:{action}:{proposal_id}"
+
+
+def parse_callback_data(data: str | None) -> tuple[str, str] | None:
+    """``(action, proposal_id)`` from a button payload, or ``None`` if it is not ours.
+
+    Strict on purpose: the prefix, one of the two known actions, and a non-empty id.
+    Anything else — a payload from an older build, a truncated one — gets no
+    interpretation at all, because the alternative is acting on a guessed proposal id.
+    """
+    if not data:
+        return None
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+    prefix, action, proposal_id = parts
+    if prefix != CALLBACK_PREFIX or action not in (CALLBACK_OK, CALLBACK_NO):
+        return None
+    return (action, proposal_id) if proposal_id else None
+
+
 def run_triage_pipeline(
     config: Config,
     hours: float,
@@ -232,6 +282,203 @@ async def _deliver_triage(message, rendered: RenderedTriage) -> None:
     # SEAM T6: when the TTS lands, the "vocale" becomes an audio file here instead
     # of text; nothing else in the pipeline changes.
     await _send(message, f"🔊 VOCALE\n\n{rendered.vocal_text}")
+
+
+# --- T10: proposals with buttons (PR3) -----------------------------------------
+
+
+def _proposal_keyboard(proposal_id: str):
+    """The two-button inline keyboard of one proposal. ✅ applies, ❌ refuses."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Applica", callback_data=build_callback_data(CALLBACK_OK, proposal_id)
+                ),
+                InlineKeyboardButton(
+                    "❌ Ignora", callback_data=build_callback_data(CALLBACK_NO, proposal_id)
+                ),
+            ]
+        ]
+    )
+
+
+async def deliver_proposals(message, config: Config) -> int:
+    """Send every ripe undelivered proposal, one message each. Returns how many went out.
+
+    After the three triage formats, never mixed into them: a question that writes on a
+    real record must not arrive inside a wall of prose.
+
+    Reads from the database rather than from what this run just created, so the queue is
+    the queue — the rows PR2 left pending are delivered too, oldest first, and a scheduled
+    removal shows up the first time somebody runs a triage after its morning.
+
+    Send first, record second: ``mark_delivered`` is what keeps a row from being asked
+    twice, so writing it before a failed send would bury the question forever.
+    """
+    store = build_proposal_store(config)
+    if store is None:
+        return 0
+    client = build_read_client(config)
+    pending = await asyncio.to_thread(
+        load_deliverable_with_names, store, client, now=datetime.now(timezone.utc)
+    )
+    for stored, nome in pending:
+        sent = await message.reply_text(
+            render_proposal(stored.proposal, nome=nome),
+            parse_mode="HTML",
+            reply_markup=_proposal_keyboard(stored.id),
+        )
+        await asyncio.to_thread(store.mark_delivered, stored.id, sent.message_id)
+    return len(pending)
+
+
+async def _edit_outcome(query, line: str) -> None:
+    """Replace the proposal message with itself plus one outcome line, buttons gone.
+
+    The question stays visible above the answer: months later the chat still says what
+    was asked and what came of it. Passing no ``reply_markup`` is what removes the
+    keyboard, so the same call closes the question and records it.
+
+    Best-effort: an edit that fails (an old message, a network blip) is logged and
+    nothing more. By the time we are here the decision is already in the database and any
+    write on Callbell has already happened — the chat is the report, not the state.
+    """
+    original = getattr(query.message, "text_html", None) or getattr(query.message, "text", "")
+    text = f"{original}\n\n{line}" if original else line
+    try:
+        await query.edit_message_text(text=text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001 - cosmetic; the state is already settled
+        logger.warning("Modifica del messaggio della proposta fallita", exc_info=True)
+
+
+async def _close_proposal(
+    store: ProposalStore, proposal_id: str, *, stato: StatoProposta, executed_at=None
+) -> None:
+    """Write the final state of a proposal, and never let that write break the handler.
+
+    The action on Callbell has already happened at this point. Losing the row's outcome
+    is bad — it will read as ``approvata`` forever — but raising here would replace a
+    wrong-looking row with a silent crash and no message at all.
+    """
+    try:
+        await asyncio.to_thread(
+            store.mark_outcome, proposal_id, stato=stato, executed_at=executed_at
+        )
+    except SupabaseError:
+        logger.warning("Stato finale della proposta non salvato", exc_info=True)
+
+
+async def _proposals_step(
+    message, config: Config, result: TriageResult, conversations: list[Conversation]
+) -> None:
+    """Build this run's proposals, then deliver the whole ripe queue.
+
+    Runs on EVERY completed run, empty window included: the queue does not belong to
+    this run. A removal that ripened at 07:00 must arrive on a quiet morning too, and
+    the rows waiting from previous runs are not this window's business either.
+
+    Unlike ``save_triage_run`` this CAN raise (invariante 3: a proposal we cannot
+    remember making must not exist), hence the guard. The triage is already delivered, so
+    a problem here costs the proposals and nothing else — and it is said out loud,
+    because silence would read as "there was nothing to propose".
+    """
+    try:
+        await asyncio.to_thread(build_and_store_proposals, config, result, conversations)
+        await deliver_proposals(message, config)
+    except Exception as exc:  # noqa: BLE001 - the triage is delivered; this must not undo it
+        logger.warning("Proposte T10 non disponibili (%s)", type(exc).__name__)
+        await message.reply_text("⚠️ Proposte non disponibili in questo run.")
+
+
+async def proposal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a tap on ✅/❌: claim the proposal, then execute it or file it as refused.
+
+    ``CallbackQueryHandler`` takes no ``filters``, so the whitelist is enforced here and
+    in the same spirit as everywhere else: an unauthorized tap gets NO answer at all, not
+    even an empty one. Answering would confirm the bot exists.
+
+    ``answer()`` counts once per query, which is why the flag check comes before it: an
+    empty answer first would turn the "Proposte disattivate" toast into an invisible one.
+    """
+    config: Config = context.bot_data["config"]
+    query = update.callback_query
+    if query is None:
+        return
+    user = update.effective_user
+    if user is None or user.id != config.telegram_allowed_user_id:
+        logger.warning("Tap su una proposta da un utente non autorizzato: ignorato")
+        return
+
+    parsed = parse_callback_data(query.data)
+    if parsed is None:
+        return
+    action, proposal_id = parsed
+
+    store = build_proposal_store(config)
+    if store is None:
+        # The kill switch stays reversible: no edit, so the buttons survive and the row
+        # stays pending. Turn the flag back on and the same tap works.
+        await query.answer("Proposte disattivate")
+        return
+    await query.answer()
+
+    now = datetime.now(timezone.utc)
+    claimed = StatoProposta.APPROVATA if action == CALLBACK_OK else StatoProposta.RIFIUTATA
+    try:
+        row = await asyncio.to_thread(
+            store.claim, proposal_id, stato=claimed, decided_at=now
+        )
+    except SupabaseError:
+        logger.warning("Claim della proposta fallito", exc_info=True)
+        await _edit_outcome(query, "⚠️ Database non raggiungibile: riprova.")
+        return
+
+    # The claim is the double-tap defence: it moves the row out of `pending` atomically,
+    # so a second tap matches nothing and finds this branch instead of a second write.
+    if row is None:
+        await _edit_outcome(query, "↩️ Proposta già gestita.")
+        return
+
+    if action == CALLBACK_NO:
+        await _edit_outcome(query, "❌ Ignorata.")
+        return
+
+    stored = row_to_stored(row)
+    if stored is None:
+        # Already claimed, and unreadable: closing it as `fallita` is the only honest end
+        # — left `approvata` it would sit there forever looking like work in progress.
+        await _close_proposal(store, proposal_id, stato=StatoProposta.FALLITA)
+        await _edit_outcome(query, "⚠️ Proposta illeggibile: non eseguita.")
+        return
+
+    await _edit_outcome(query, "⏳ Applico…")
+    try:
+        outcome = await asyncio.to_thread(
+            execute, stored, client=build_write_client(config), store=store, now=now
+        )
+    except CallbellError as exc:
+        logger.warning("Esecuzione della proposta fallita: %s", exc)
+        outcome = ExecutionOutcome(False, f"Errore su Callbell: {exc}")
+    except SupabaseError as exc:
+        # The executor swallows storage failures that happen AFTER a successful PATCH, so
+        # anything reaching here happened before one: nothing was written, and saying so
+        # spares a trip to Callbell to check.
+        logger.warning("Esecuzione della proposta fallita: %s", exc)
+        outcome = ExecutionOutcome(
+            False, f"Errore sul database, niente scritto su Callbell: {exc}"
+        )
+
+    await _close_proposal(
+        store,
+        proposal_id,
+        stato=StatoProposta.ESEGUITA if outcome.ok else StatoProposta.FALLITA,
+        executed_at=now if outcome.ok else None,
+    )
+    symbol = "✅" if outcome.ok else "⚠️"
+    await _edit_outcome(query, f"{symbol} {html.escape(outcome.message, quote=False)}")
 
 
 async def _failed(
@@ -338,6 +585,9 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "duration_ms": _elapsed_ms(run_started),
                 },
             )
+            # Nothing to judge does not mean nothing to ask: a scheduled removal that
+            # ripened this morning is waiting whatever this window contained.
+            await _proposals_step(message, config, result, conversations)
             return
 
         try:
@@ -357,20 +607,8 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             },
         )
 
-        # T10/PR2: the proposals are BUILT and PERSISTED here, and delivered nowhere —
-        # the buttons arrive in PR3. This spot, before the best-effort save, is where
-        # their delivery will go, so nothing gets reshuffled later.
-        #
-        # Unlike save_triage_run this CAN raise (invariante 3: a proposal we cannot
-        # remember making must not exist), hence the guard. The triage is already out,
-        # so a storage problem is a warning and not the user's problem; in PR3 this
-        # except becomes the "proposte non disponibili in questo run" line.
-        try:
-            await asyncio.to_thread(
-                build_and_store_proposals, config, result, conversations
-            )
-        except Exception as exc:  # noqa: BLE001 - the triage is delivered; this must not undo it
-            logger.warning("Proposte T10 non create (%s)", type(exc).__name__)
+        # T10/PR3: after the three formats and before the best-effort save.
+        await _proposals_step(message, config, result, conversations)
 
         # T7: best-effort, after delivery, off the event loop. Cannot raise.
         await asyncio.to_thread(
@@ -379,16 +617,28 @@ async def triage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle ``/start`` and ``/help`` (whitelisted): show the usage."""
+    """Handle ``/start`` and ``/help`` (whitelisted): show the usage.
+
+    The line about the proposals appears only when they are on: with the flag off the bot
+    is read-only end to end, and promising buttons that will never arrive is worse than
+    saying nothing.
+    """
+    config: Config = context.bot_data["config"]
     message = update.effective_message
     if message is None:
         return
-    await message.reply_text(
-        "Triage delle conversazioni WhatsApp della clinica (sola lettura).\n"
-        "• /triage — ultime 6 ore\n"
-        "• /triage 12 — ultime 12 ore\n"
-        "Rispondo con tre messaggi: schema, tabella e vocale (sintesi)."
-    )
+    lines = [
+        "Triage delle conversazioni WhatsApp della clinica (sola lettura).",
+        "• /triage — ultime 6 ore",
+        "• /triage 12 — ultime 12 ore",
+        "Rispondo con tre messaggi: schema, tabella e vocale (sintesi).",
+    ]
+    if config.enable_proposals:
+        lines.append(
+            "Dopo i tre messaggi possono arrivare proposte di tag o rinomina, "
+            "una per messaggio: scrivo su Callbell solo se tocchi ✅."
+        )
+    await message.reply_text("\n".join(lines))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -428,7 +678,12 @@ def build_bot(config: Config) -> Application:
     fallback/catch-all handler on purpose, so nothing ever confirms the bot to an
     unauthorized user. The bot token is never logged.
     """
-    from telegram.ext import ApplicationBuilder, CommandHandler, filters
+    from telegram.ext import (
+        ApplicationBuilder,
+        CallbackQueryHandler,
+        CommandHandler,
+        filters,
+    )
 
     application = ApplicationBuilder().token(config.telegram_bot_token).build()
     application.bot_data["config"] = config
@@ -438,6 +693,12 @@ def build_bot(config: Config) -> Application:
     application.add_handler(CommandHandler("triage", triage_command, filters=allowed))
     application.add_handler(CommandHandler("start", start_command, filters=allowed))
     application.add_handler(CommandHandler("help", start_command, filters=allowed))
+    # T10: a CallbackQueryHandler takes no `filters`, so the pattern only keeps other
+    # people's payloads out — the whitelist itself is enforced inside the handler, and
+    # with the same silence.
+    application.add_handler(
+        CallbackQueryHandler(proposal_callback, pattern=rf"^{CALLBACK_PREFIX}:")
+    )
     application.add_error_handler(on_error)
     return application
 

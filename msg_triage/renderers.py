@@ -37,6 +37,7 @@ import html
 import re
 from dataclasses import dataclass
 
+from .proposals import Proposal, TipoProposta
 from .triage_engine import (
     SPECIES_MARKER,
     ConversationTriage,
@@ -597,3 +598,36 @@ def render_all(result: TriageResult) -> RenderedTriage:
         table_text=render_table(result),
         vocal_text=render_voice(result),
     )
+
+
+# --- T10: the one-line question a proposal asks on Telegram --------------------
+
+
+def render_proposal(proposal: Proposal, *, nome: str) -> str:
+    """The Telegram text of one proposal: what we would do, to whom, and why.
+
+    Lives here and not in ``proposals.py`` because this is where the HTML escaping
+    discipline lives: escape the untrusted parts first (the contact name comes from
+    Callbell, the proposed name from the model through the rules), add our own ``<b>``
+    afterwards. The rules module stays pure and keeps only ``motivo``, the short factual
+    phrase stored on the row.
+
+    Self-sufficient by design: the question is readable months later, out of context,
+    with no reference to the triage that produced it — a tap can happen any time.
+
+    ``motivo`` describes the state of the conversation, never the work of a colleague
+    (paletto etico): the rules already phrase it that way, and nothing is added here.
+    """
+    chi = html.escape(nome, quote=False)
+    motivo = html.escape(proposal.motivo, quote=False)
+    if proposal.tipo is TipoProposta.RENAME:
+        proposto = html.escape(str(proposal.payload.get("nome", "")), quote=False)
+        question = f"✏️ Rinominare «<b>{chi}</b>» in «<b>{proposto}</b>»?"
+    else:
+        tag = html.escape(proposal.tag, quote=False)
+        verb = "Aggiungere" if proposal.tipo is TipoProposta.TAG_ADD else "Togliere"
+        preposition = "a" if proposal.tipo is TipoProposta.TAG_ADD else "da"
+        question = (
+            f"🏷️ {verb} il tag «<b>{tag}</b>» {preposition} <b>{chi}</b>?"
+        )
+    return f"{question}\n<i>{motivo}</i>" if motivo else question

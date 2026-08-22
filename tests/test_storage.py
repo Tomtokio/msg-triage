@@ -148,6 +148,9 @@ class FakeSession:
     def patch(self, url, **kwargs):
         return self._record("PATCH", url, **kwargs)
 
+    def delete(self, url, **kwargs):
+        return self._record("DELETE", url, **kwargs)
+
 
 # --- is_configured: the feature flag -------------------------------------------
 
@@ -492,3 +495,52 @@ def test_failure_on_the_states_call_leaves_no_exception_behind(caplog):
 
     assert len(session.calls) == 2
     assert "conversation_states" in caplog.text
+
+
+# --- The upsert and the delete T10/PR3 needs -----------------------------------
+
+
+def test_insert_is_a_plain_post_unless_on_conflict_is_asked_for():
+    session = FakeSession()
+
+    _bare_store(session).insert("system_tags", [{"contact_id": "c1", "tag": "Ricoverato"}])
+
+    call = session.calls[0]
+    assert call["headers"]["Prefer"] == "return=minimal"
+    assert call["params"] is None
+
+
+def test_insert_with_on_conflict_becomes_an_upsert():
+    # system_tags has `unique (contact_id, tag)`: a re-application must not be a 409,
+    # or a proposal whose write on Callbell already went through would report as failed.
+    session = FakeSession()
+
+    _bare_store(session).insert(
+        "system_tags", [{"contact_id": "c1", "tag": "Ricoverato"}], on_conflict="contact_id,tag"
+    )
+
+    call = session.calls[0]
+    assert call["headers"]["Prefer"] == "return=minimal,resolution=merge-duplicates"
+    assert call["params"] == {"on_conflict": "contact_id,tag"}
+
+
+def test_delete_sends_the_filter_and_the_write_profile():
+    session = FakeSession()
+
+    _bare_store(session).delete("system_tags", {"contact_id": 'eq."c1"'})
+
+    call = session.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["url"].endswith("/system_tags")
+    assert call["params"] == {"contact_id": 'eq."c1"'}
+    assert call["headers"]["Content-Profile"] == SCHEMA
+
+
+def test_delete_refuses_an_empty_filter():
+    # PostgREST empties the whole table on an unfiltered DELETE, and there is no undo.
+    session = FakeSession()
+
+    with pytest.raises(SupabaseError):
+        _bare_store(session).delete("system_tags", {})
+
+    assert session.calls == []

@@ -16,8 +16,13 @@ from typing import NamedTuple
 import pytest
 
 from msg_triage import telegram_bot
+from msg_triage.callbell_adapter import CallbellError
 from msg_triage.config import Config, load_config
+from msg_triage.proposal_executor import ExecutionOutcome
+from msg_triage.proposal_store import StoredProposal
+from msg_triage.proposals import Proposal, StatoProposta, TipoProposta
 from msg_triage.renderers import render_all
+from msg_triage.storage import SupabaseError
 from msg_triage.telegram_bot import (
     DEFAULT_WINDOW_HOURS,
     parse_window_hours,
@@ -93,23 +98,62 @@ class _FakeEngine:
         return self._result
 
 
+class _SentMessage(NamedTuple):
+    """What Telegram hands back after a send: PR3 needs the id to mark a row delivered."""
+
+    message_id: int
+
+
 class _FakeMessage:
     def __init__(self):
         self.replies: list[str] = []
         self.parse_modes: list[str | None] = []
+        self.markups: list[object] = []
+        self._next_id = 1000
 
     async def reply_text(self, text, **kwargs):
         self.replies.append(text)
         self.parse_modes.append(kwargs.get("parse_mode"))
+        self.markups.append(kwargs.get("reply_markup"))
+        self._next_id += 1
+        return _SentMessage(self._next_id)
+
+
+class _FakeQueryMessage:
+    """The proposal message a callback query points back at."""
+
+    def __init__(self, text_html: str):
+        self.text_html = text_html
+        self.text = text_html
+
+
+class _FakeCallbackQuery:
+    def __init__(self, data: str, *, text_html: str = "🏷️ Aggiungere?"):
+        self.data = data
+        self.message = _FakeQueryMessage(text_html)
+        self.answers: list[str | None] = []
+        self.edits: list[str] = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append(text)
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append(text)
 
 
 class _FakeUpdate:
-    def __init__(self, message):
+    def __init__(self, message=None, *, callback_query=None, user_id=None):
         self.effective_message = message
+        self.callback_query = callback_query
+        self.effective_user = _FakeUser(user_id) if user_id is not None else None
+
+
+class _FakeUser(NamedTuple):
+    id: int
 
 
 class _FakeContext:
-    def __init__(self, *, config, lock, args):
+    def __init__(self, *, config, lock=None, args=None):
         self.bot_data = {"config": config, "triage_lock": lock}
         self.args = args
 
@@ -411,8 +455,10 @@ def test_a_failing_proposal_step_does_not_undo_the_triage(monkeypatch, caplog):
         asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
 
     # The triage is already delivered and the run still saves: a storage problem with
-    # the proposals is a warning, not the user's problem. The message never travels.
-    assert len(message.replies) == 4
+    # the proposals costs the proposals and nothing else. It IS said out loud, because
+    # silence would read as "there was nothing to propose". The message never travels.
+    assert len(message.replies) == 5
+    assert message.replies[-1] == "⚠️ Proposte non disponibili in questo run."
     assert len(saves) == 1
     assert "RuntimeError" in caplog.text
     assert "PostgREST" not in caplog.text
@@ -582,3 +628,341 @@ def test_build_bot_wires_config_lock_and_whitelisted_triage():
     triage = next(h for h in handlers if "triage" in getattr(h, "commands", set()))
     # The whitelist lives on the handler filter (only the allowed user reaches it).
     assert triage.filters is not None
+
+
+# --- T10/PR3: consegna delle proposte e tap sui bottoni ------------------------
+
+
+PROPOSAL_ID = "11111111-1111-1111-1111-111111111111"
+OTHER_ID = "22222222-2222-2222-2222-222222222222"
+ALLOWED_USER = int(_COMPLETE_ENV["TELEGRAM_ALLOWED_USER_ID"])
+
+
+def _proposals_config() -> Config:
+    return load_config(
+        {
+            **_COMPLETE_ENV,
+            "SUPABASE_URL": "https://demo.supabase.co",
+            "SUPABASE_KEY": "eyJh-fake",
+            "ENABLE_PROPOSALS": "true",
+        }
+    )
+
+
+def _stored(proposal_id=PROPOSAL_ID, tipo=TipoProposta.TAG_ADD, payload=None):
+    return StoredProposal(
+        id=proposal_id,
+        proposal=Proposal(
+            contact_id="c1",
+            tipo=tipo,
+            payload=payload if payload is not None else {"tag": "Ricoverato"},
+            motivo="dai messaggi risulta un ricovero in corso",
+        ),
+    )
+
+
+def _claimed_row(**over) -> dict:
+    """La riga che il claim restituisce a chi l'ha vinta."""
+    base = {
+        "id": PROPOSAL_ID,
+        "contact_id": "c1",
+        "tipo": "tag_add",
+        "payload": {"tag": "Ricoverato"},
+        "motivo": "dai messaggi risulta un ricovero in corso",
+        "matures_at": None,
+    }
+    base.update(over)
+    return base
+
+
+class _FakeProposalStore:
+    def __init__(self, *, claimed=None):
+        self._claimed = claimed
+        self.delivered: list[tuple[str, int]] = []
+        self.claims: list[tuple] = []
+        self.outcomes: list[tuple] = []
+
+    def mark_delivered(self, proposal_id, telegram_message_id):
+        self.delivered.append((proposal_id, telegram_message_id))
+
+    def claim(self, proposal_id, *, stato, decided_at):
+        self.claims.append((proposal_id, stato))
+        return self._claimed
+
+    def mark_outcome(self, proposal_id, *, stato, executed_at=None):
+        self.outcomes.append((proposal_id, stato, executed_at))
+
+
+def _wire_callback(monkeypatch, *, store, executor=None):
+    """Swap the two boundaries the callback crosses: the store and the executor."""
+    monkeypatch.setattr(telegram_bot, "build_proposal_store", lambda config: store)
+    monkeypatch.setattr(telegram_bot, "build_write_client", lambda config: "write-client")
+    if executor is not None:
+        monkeypatch.setattr(telegram_bot, "execute", executor)
+
+
+# --- callback_data (puro) ------------------------------------------------------
+
+
+def test_callback_data_round_trips():
+    data = telegram_bot.build_callback_data(telegram_bot.CALLBACK_OK, PROPOSAL_ID)
+    assert telegram_bot.parse_callback_data(data) == (telegram_bot.CALLBACK_OK, PROPOSAL_ID)
+    # Il limite di Telegram è 64 byte: un uuid col prefisso ci sta comodo.
+    assert len(data.encode()) <= 64
+
+
+@pytest.mark.parametrize(
+    "data",
+    [None, "", "t10:ok", "altro:ok:" + PROPOSAL_ID, "t10:forse:" + PROPOSAL_ID, "t10:ok:"],
+)
+def test_un_payload_che_non_e_nostro_non_si_interpreta(data):
+    # L'alternativa sarebbe agire su un id di proposta indovinato.
+    assert telegram_bot.parse_callback_data(data) is None
+
+
+# --- consegna ------------------------------------------------------------------
+
+
+def test_deliver_proposals_manda_un_messaggio_per_proposta_con_i_bottoni(monkeypatch):
+    store = _FakeProposalStore()
+    monkeypatch.setattr(telegram_bot, "build_proposal_store", lambda config: store)
+    monkeypatch.setattr(telegram_bot, "build_read_client", lambda config: "read-client")
+    monkeypatch.setattr(
+        telegram_bot,
+        "load_deliverable_with_names",
+        lambda s, c, *, now: [(_stored(), "Bonifazi"), (_stored(OTHER_ID), "Rossi")],
+    )
+    message = _FakeMessage()
+
+    sent = asyncio.run(telegram_bot.deliver_proposals(message, _proposals_config()))
+
+    assert sent == 2
+    assert len(message.replies) == 2  # mai un blocco unico
+    assert "Bonifazi" in message.replies[0]
+    assert message.parse_modes == ["HTML", "HTML"]
+    assert all(markup is not None for markup in message.markups)
+    # Prima si manda, poi si registra: è quello che impedisce una seconda consegna.
+    assert store.delivered == [(PROPOSAL_ID, 1001), (OTHER_ID, 1002)]
+
+
+def test_col_flag_spento_non_si_consegna_niente(monkeypatch):
+    monkeypatch.setattr(
+        telegram_bot,
+        "load_deliverable_with_names",
+        lambda *a, **k: pytest.fail("non deve nemmeno guardare la coda"),
+    )
+    message = _FakeMessage()
+
+    assert asyncio.run(telegram_bot.deliver_proposals(message, _config())) == 0
+    assert message.replies == []
+
+
+# --- tap ✅ / ❌ ---------------------------------------------------------------
+
+
+def _tap(action, *, store, executor=None, monkeypatch, user_id=ALLOWED_USER):
+    _wire_callback(monkeypatch, store=store, executor=executor)
+    query = _FakeCallbackQuery(telegram_bot.build_callback_data(action, PROPOSAL_ID))
+    update = _FakeUpdate(callback_query=query, user_id=user_id)
+    asyncio.run(
+        telegram_bot.proposal_callback(update, _FakeContext(config=_proposals_config()))
+    )
+    return query
+
+
+def test_un_tap_su_applica_esegue_e_racconta_l_esito(monkeypatch):
+    store = _FakeProposalStore(claimed=_claimed_row())
+    calls = []
+
+    def fake_execute(stored, *, client, store, now):
+        calls.append(stored.id)
+        return ExecutionOutcome(True, "Tag «Ricoverato» aggiunto.")
+
+    query = _tap(
+        telegram_bot.CALLBACK_OK, store=store, executor=fake_execute, monkeypatch=monkeypatch
+    )
+
+    assert calls == [PROPOSAL_ID]
+    assert store.claims == [(PROPOSAL_ID, StatoProposta.APPROVATA)]
+    assert store.outcomes[0][1] is StatoProposta.ESEGUITA
+    assert store.outcomes[0][2] is not None  # executed_at valorizzato
+    assert query.edits[0].endswith("⏳ Applico…")
+    assert "✅ Tag «Ricoverato» aggiunto." in query.edits[-1]
+    # La domanda resta sopra la risposta: la chat racconta cosa è stato chiesto.
+    assert query.edits[-1].startswith("🏷️ Aggiungere?")
+
+
+def test_un_tap_su_ignora_non_tocca_callbell(monkeypatch):
+    store = _FakeProposalStore(claimed=_claimed_row())
+
+    def never(*a, **k):
+        pytest.fail("❌ non deve eseguire niente")
+
+    query = _tap(telegram_bot.CALLBACK_NO, store=store, executor=never, monkeypatch=monkeypatch)
+
+    assert store.claims == [(PROPOSAL_ID, StatoProposta.RIFIUTATA)]
+    assert store.outcomes == []
+    assert query.edits[-1].endswith("❌ Ignorata.")
+
+
+def test_il_secondo_tap_trova_la_proposta_gia_gestita(monkeypatch):
+    # La difesa dal doppio tap vive nel DB: il claim non trova più la riga pending.
+    store = _FakeProposalStore(claimed=None)
+
+    def never(*a, **k):
+        pytest.fail("una proposta già decisa non si riesegue")
+
+    query = _tap(telegram_bot.CALLBACK_OK, store=store, executor=never, monkeypatch=monkeypatch)
+
+    assert store.outcomes == []
+    assert "già gestita" in query.edits[-1]
+
+
+def test_una_riga_illeggibile_dopo_il_claim_si_chiude_come_fallita(monkeypatch):
+    store = _FakeProposalStore(claimed=_claimed_row(tipo="boh"))
+
+    def never(*a, **k):
+        pytest.fail("non c'è niente da eseguire")
+
+    query = _tap(telegram_bot.CALLBACK_OK, store=store, executor=never, monkeypatch=monkeypatch)
+
+    # Lasciata `approvata` resterebbe lì per sempre a sembrare lavoro in corso.
+    assert store.outcomes == [(PROPOSAL_ID, StatoProposta.FALLITA, None)]
+    assert "illeggibile" in query.edits[-1]
+
+
+def test_un_errore_su_callbell_diventa_fallita_e_un_messaggio_non_un_crash(monkeypatch):
+    store = _FakeProposalStore(
+        claimed=_claimed_row(tipo="rename", payload={"nome": "Mario Rossi"})
+    )
+
+    def boom(stored, *, client, store, now):
+        raise CallbellError("Callbell error 500 on PATCH /contacts/c1")
+
+    query = _tap(telegram_bot.CALLBACK_OK, store=store, executor=boom, monkeypatch=monkeypatch)
+
+    assert store.outcomes == [(PROPOSAL_ID, StatoProposta.FALLITA, None)]
+    assert "⚠️" in query.edits[-1] and "Callbell" in query.edits[-1]
+
+
+def test_un_tap_da_un_utente_non_autorizzato_resta_in_silenzio(monkeypatch):
+    store = _FakeProposalStore(claimed=_claimed_row())
+
+    query = _tap(
+        telegram_bot.CALLBACK_OK,
+        store=store,
+        executor=lambda *a, **k: pytest.fail("niente esecuzione"),
+        monkeypatch=monkeypatch,
+        user_id=ALLOWED_USER + 1,
+    )
+
+    # Nemmeno un answer(): rispondere confermerebbe che il bot esiste.
+    assert query.answers == []
+    assert query.edits == []
+    assert store.claims == []
+
+
+def test_col_flag_spento_il_tap_e_inerte_e_i_bottoni_restano(monkeypatch):
+    # Nessun edit: l'edit toglierebbe la tastiera e lascerebbe la riga pending orfana.
+    # Così il kill switch si riaccende senza mettere le mani sul DB.
+    monkeypatch.setattr(telegram_bot, "build_proposal_store", lambda config: None)
+    query = _FakeCallbackQuery(
+        telegram_bot.build_callback_data(telegram_bot.CALLBACK_OK, PROPOSAL_ID)
+    )
+    update = _FakeUpdate(callback_query=query, user_id=ALLOWED_USER)
+
+    asyncio.run(telegram_bot.proposal_callback(update, _FakeContext(config=_config())))
+
+    assert query.answers == ["Proposte disattivate"]
+    assert query.edits == []
+
+
+def test_un_database_irraggiungibile_al_claim_non_lascia_l_utente_appeso(monkeypatch):
+    class _Broken(_FakeProposalStore):
+        def claim(self, proposal_id, *, stato, decided_at):
+            raise SupabaseError("PostgREST è giù")
+
+    query = _tap(
+        telegram_bot.CALLBACK_OK,
+        store=_Broken(),
+        executor=lambda *a, **k: pytest.fail("niente esecuzione"),
+        monkeypatch=monkeypatch,
+    )
+
+    assert "Database non raggiungibile" in query.edits[-1]
+
+
+def test_build_bot_registra_il_gestore_dei_bottoni():
+    from telegram.ext import CallbackQueryHandler
+
+    application = telegram_bot.build_bot(_proposals_config())
+
+    handlers = application.handlers[0]
+    callback_handlers = [h for h in handlers if isinstance(h, CallbackQueryHandler)]
+    assert len(callback_handlers) == 1
+    assert callback_handlers[0].callback is telegram_bot.proposal_callback
+
+
+def test_l_aiuto_nomina_i_bottoni_solo_quando_le_proposte_sono_accese():
+    for config, expected in ((_config(), False), (_proposals_config(), True)):
+        message = _FakeMessage()
+        asyncio.run(
+            telegram_bot.start_command(_FakeUpdate(message), _FakeContext(config=config))
+        )
+        assert ("✅" in message.replies[0]) is expected
+
+
+def test_anche_una_finestra_vuota_consegna_la_coda_in_attesa(monkeypatch):
+    """La coda non è di questo run: una rimozione maturata stamattina deve arrivare
+    anche in una giornata silenziosa.
+
+    Stessa lista condivisa del test sull'ordine a finestra piena, così si asserisce
+    l'ORDINE e non solo le chiamate. Qui il salvataggio non c'è per costruzione (una riga
+    `triage_runs` implica delle conversazioni), quindi quello che si pinna è: le proposte
+    stanno DOPO il messaggio all'utente, e non c'è nessun save da scavalcare.
+    """
+    empty = _result()
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_triage_pipeline",
+        lambda config, hours, *, job_id=None: (empty, render_all(empty), []),
+    )
+    message = _FakeMessage()
+    order: list[str] = []
+    built: list[dict] = []
+
+    def fake_build(config, built_result, conversations):
+        order.append("proposals")
+        built.append({"result": built_result, "replies_so_far": len(message.replies)})
+        return []
+
+    async def fake_deliver(msg, config):
+        order.append("deliver")
+        return 0
+
+    monkeypatch.setattr(telegram_bot, "build_and_store_proposals", fake_build)
+    monkeypatch.setattr(telegram_bot, "deliver_proposals", fake_deliver)
+    saves = _record_saves(monkeypatch, message)
+    context = _FakeContext(config=_config(), lock=asyncio.Lock(), args=None)
+
+    asyncio.run(telegram_bot.triage_command(_FakeUpdate(message), context))
+
+    assert order == ["proposals", "deliver"]
+    assert saves == []  # niente conversazioni, niente riga triage_runs
+    # Mai nel percorso critico: il messaggio all'utente era già uscito.
+    assert built[0]["replies_so_far"] == 2
+    assert message.replies[-1].startswith("✅ Nessuna conversazione")
+
+
+def test_un_errore_di_database_prima_della_scrittura_lo_dice_chiaramente(monkeypatch):
+    store = _FakeProposalStore(claimed=_claimed_row(tipo="tag_remove"))
+
+    def boom(stored, *, client, store, now):
+        raise SupabaseError("system_tags: HTTP 503")
+
+    query = _tap(telegram_bot.CALLBACK_OK, store=store, executor=boom, monkeypatch=monkeypatch)
+
+    # L'esecutore ingoia i guasti DOPO una PATCH riuscita: se arriva fin qui, non è
+    # stato scritto niente, e dirlo risparmia un giro su Callbell a controllare.
+    assert "niente scritto su Callbell" in query.edits[-1]
+    assert store.outcomes == [(PROPOSAL_ID, StatoProposta.FALLITA, None)]

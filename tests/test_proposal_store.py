@@ -21,12 +21,15 @@ from msg_triage.config import Config, load_config
 from msg_triage.proposal_store import (
     ProposalStore,
     build_and_store_proposals,
+    build_proposal_store,
     proposals_enabled,
+    row_to_stored,
 )
 from msg_triage.proposals import (
     TAG_DIMISSIONE_OGGI,
     TAG_RICOVERATO,
     Proposal,
+    StatoProposta,
     TipoProposta,
 )
 from msg_triage.source_adapter import Conversation
@@ -105,6 +108,9 @@ class FakeSession:
 
     def patch(self, url, **kwargs):
         return self._record("PATCH", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self._record("DELETE", url, **kwargs)
 
 
 def _store(session: FakeSession) -> ProposalStore:
@@ -450,3 +456,170 @@ def test_gli_id_delle_proposte_sono_uuid_veri_di_default():
     [item] = _store(session).insert_pending([_proposal()])
 
     uuid.UUID(item.id)  # solleva se non lo è
+
+
+# --- PR3: rilettura delle righe, consegna, claim, system_tags ------------------
+
+
+def _row(**over) -> dict:
+    base = {
+        "id": IDS[0],
+        "contact_id": "c1",
+        "tipo": "tag_add",
+        "payload": {"tag": TAG_RICOVERATO},
+        "motivo": "dai messaggi risulta un ricovero in corso",
+        "matures_at": None,
+    }
+    base.update(over)
+    return base
+
+
+def test_una_riga_torna_proposta_con_il_suo_id():
+    stored = row_to_stored(_row(matures_at="2026-08-08T07:00:00+02:00"))
+
+    assert stored is not None
+    assert stored.id == IDS[0]
+    assert stored.proposal.tipo is TipoProposta.TAG_ADD
+    assert stored.proposal.tag == TAG_RICOVERATO
+    assert stored.proposal.motivo == "dai messaggi risulta un ricovero in corso"
+    assert stored.proposal.matures_at == datetime(2026, 8, 8, 5, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _row(tipo="assegna_a"),  # un tipo che questo codice non conosce
+        _row(tipo=None),
+        _row(payload=None),  # payload illeggibile
+        _row(id=None),
+    ],
+)
+def test_una_riga_che_non_sappiamo_leggere_torna_none_e_non_solleva(row, caplog):
+    with caplog.at_level(logging.WARNING, logger="msg_triage.proposal_store"):
+        assert row_to_stored(row) is None
+    assert caplog.records  # e lo dice, invece di sparire in silenzio
+
+
+def test_la_consegna_chiede_solo_le_pending_mature_e_mai_consegnate():
+    session = FakeSession([FakeResponse(payload=[_row(), _row(id=IDS[1], tipo="rename")])])
+
+    stored = _store(session).load_deliverable(now=NOW)
+
+    params = session.calls[0]["params"]
+    assert params["stato"] == "eq.pending"
+    assert params["telegram_message_id"] == "is.null"
+    # Immediate o già mature: una rimozione programmata per domani non si consegna oggi.
+    assert params["or"] == f'(matures_at.is.null,matures_at.lte."{NOW.isoformat()}")'
+    # La coda è una coda: le righe più vecchie per prime.
+    assert params["order"] == "created_at.asc"
+    assert [item.id for item in stored] == IDS
+
+
+def test_una_riga_illeggibile_non_fa_cadere_tutta_la_consegna():
+    session = FakeSession([FakeResponse(payload=[_row(tipo="boh"), _row(id=IDS[1])])])
+
+    stored = _store(session).load_deliverable(now=NOW)
+
+    assert [item.id for item in stored] == [IDS[1]]
+
+
+def test_mark_delivered_registra_il_messaggio_telegram():
+    session = FakeSession()
+
+    _store(session).mark_delivered(IDS[0], 4242)
+
+    call = session.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["params"] == {"id": f'eq."{IDS[0]}"'}
+    assert call["json"] == {"telegram_message_id": 4242}
+
+
+def test_il_claim_filtra_su_pending_e_torna_la_riga_vinta():
+    session = FakeSession([FakeResponse(payload=[_row()])])
+
+    row = _store(session).claim(IDS[0], stato=StatoProposta.APPROVATA, decided_at=NOW)
+
+    call = session.calls[0]
+    # Il compare-and-swap: senza `stato=eq.pending` due tap scriverebbero due volte.
+    assert call["params"] == {"id": f'eq."{IDS[0]}"', "stato": "eq.pending"}
+    assert call["json"] == {"stato": "approvata", "decided_at": NOW.isoformat()}
+    assert call["headers"]["Prefer"] == "return=representation"
+    assert row is not None and row["id"] == IDS[0]
+
+
+def test_il_secondo_tap_non_rivendica_niente():
+    # La prima PATCH vince la riga, la seconda non trova più nulla da aggiornare.
+    session = FakeSession([FakeResponse(payload=[_row()]), FakeResponse(payload=[])])
+    store = _store(session)
+
+    assert store.claim(IDS[0], stato=StatoProposta.APPROVATA, decided_at=NOW) is not None
+    assert store.claim(IDS[0], stato=StatoProposta.APPROVATA, decided_at=NOW) is None
+
+
+def test_mark_outcome_scrive_executed_at_solo_quando_c_e():
+    session = FakeSession()
+    store = _store(session)
+
+    store.mark_outcome(IDS[0], stato=StatoProposta.ESEGUITA, executed_at=NOW)
+    store.mark_outcome(IDS[1], stato=StatoProposta.FALLITA)
+
+    assert session.calls[0]["json"] == {"stato": "eseguita", "executed_at": NOW.isoformat()}
+    assert session.calls[1]["json"] == {"stato": "fallita"}
+
+
+def test_record_system_tag_e_un_upsert_sulla_coppia_contatto_tag():
+    session = FakeSession()
+
+    _store(session).record_system_tag(
+        "c1", TAG_DIMISSIONE_OGGI, proposta_id=IDS[0], applied_at=NOW
+    )
+
+    call = session.calls[0]
+    assert call["url"].endswith("/system_tags")
+    assert call["params"] == {"on_conflict": "contact_id,tag"}
+    assert "resolution=merge-duplicates" in call["headers"]["Prefer"]
+    assert call["json"] == [
+        {
+            "contact_id": "c1",
+            "tag": TAG_DIMISSIONE_OGGI,
+            "applied_at": NOW.isoformat(),
+            "proposta_id": IDS[0],
+        }
+    ]
+
+
+def test_forget_system_tag_cancella_la_riga_e_quota_il_tag_con_lo_spazio():
+    session = FakeSession()
+
+    _store(session).forget_system_tag("c1", TAG_DIMISSIONE_OGGI)
+
+    call = session.calls[0]
+    assert call["method"] == "DELETE"
+    # Le virgolette non sono decorazione: due tag su tre contengono uno spazio.
+    assert call["params"] == {"contact_id": 'eq."c1"', "tag": 'eq."Dimissione oggi"'}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda store: store.load_deliverable(now=NOW),
+        lambda store: store.mark_delivered(IDS[0], 1),
+        lambda store: store.claim(IDS[0], stato=StatoProposta.RIFIUTATA, decided_at=NOW),
+        lambda store: store.mark_outcome(IDS[0], stato=StatoProposta.FALLITA),
+        lambda store: store.record_system_tag(
+            "c1", TAG_RICOVERATO, proposta_id=IDS[0], applied_at=NOW
+        ),
+        lambda store: store.forget_system_tag("c1", TAG_RICOVERATO),
+    ],
+)
+def test_anche_le_operazioni_di_pr3_propagano_gli_errori(action):
+    session = FakeSession(raises=requests.ConnectionError("rete giù"))
+
+    with pytest.raises(SupabaseError):
+        action(_store(session))
+
+
+def test_lo_store_non_si_costruisce_senza_il_flag_o_senza_supabase():
+    assert build_proposal_store(_config(proposals="false")) is None
+    assert build_proposal_store(_config(url="unused")) is None
+    assert build_proposal_store(_config()) is not None

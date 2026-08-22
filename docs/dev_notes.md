@@ -99,6 +99,20 @@ quello che aveva dato il sospetto, che è il caso che conta.
 - Cosa NON è escluso: il tempo che passa fra la lettura della lista e la scrittura alla
   conferma del tap (minuti o ore, in PR3). Quella è freschezza al momento della scrittura ed è
   una domanda diversa: qui cade il difetto STRUTTURALE, non la deriva TEMPORALE.
+  **PR3 l'ha chiusa così: si rilegge il contatto con `get_contact()` immediatamente prima di
+  ogni PATCH sui tag, e mai dalla lista del triage.** Il gate della PROPOSTA resta sulla
+  lista (è lì che si decide se vale la pena chiedere); la LISTA CHE SI SCRIVE nasce sempre da
+  una rilettura, perché la PATCH è un REPLACE e una lista vecchia di ore cancellerebbe in
+  silenzio i tag messi da una collega nel frattempo. Una GET a tap, e i tap sono rari.
+  L'eco della PATCH si confronta **tag per tag e byte per byte, ma ORDINE ESCLUSO**: `tags`
+  è un insieme assoluto anche nel modello di Callbell e nessuno legge una posizione, mentre
+  far fallire una scrittura riuscita lascerebbe in chat un «⚠️ errore» su un tag che è
+  davvero sul contatto. Quello che resta verificato esattamente è ciò che conta: nessun tag
+  perso, nessuno inventato, nessun nome normalizzato. Il confronto è fra **multiset**
+  (`sorted`, non `set`): un set collasserebbe i duplicati e «nessun tag perso» direbbe il
+  falso. E se l'ordine cambia si logga un WARNING col `contact_id`: che Callbell riordini
+  non è mai stato verificato (la pulizia del 2026-08-04 toglieva soltanto), così ogni
+  scrittura vera diventa un probe su quell'assunzione invece di accettarla in silenzio.
 - Portata: un contatto, un momento. Un secondo caso discordante non smentirebbe questo fatto,
   ma varrebbe un altro giro di probe prima di trattare la coincidenza come regola generale.
 
@@ -184,6 +198,33 @@ scripts/probe_rename.py, nove verifiche tutte passate).
   una stringa scritta su un record vero (un nome contatto) passa prima da un controllo di
   plausibilità. Un valore che non riconosciamo produce NESSUNA proposta, mai una sbagliata.
 
+### La consegna e il tap (PR3)
+- **La coda non è del run.** Si consegna ogni proposta `pending` e matura (`matures_at` nullo
+  o passato), ordinata per `created_at`, anche a finestra vuota: una rimozione maturata alle
+  07:00 non è affare della finestra che si sta guardando. PR4 aggiunge il *job*, non un'altra
+  logica di consegna.
+- **Una riga si consegna una volta sola**: il filtro è `telegram_message_id is null` e la
+  colonna si scrive DOPO l'invio. Al contrario, un invio fallito seppellirebbe la domanda per
+  sempre. Un doppione (invio riuscito, registrazione fallita) costa un messaggio in più: il
+  claim rende inerte il secondo tap.
+- **La difesa dal doppio tap vive nel DB**, che è l'unico posto dove due tap si incontrano:
+  la PATCH di claim porta `stato=eq.pending` e `return=representation`. Zero righe indietro
+  = qualcuno ha già deciso. `decided_at` si scrive lì, ed è da lì che si misurano i 30 giorni
+  di riproponibilità di un tag rifiutato.
+- **`answer()` vale una volta sola per query**, quindi il controllo del flag viene PRIMA: un
+  `answer()` vuoto renderebbe invisibile il toast «Proposte disattivate». E a flag spento non
+  si edita il messaggio: la tastiera resta, la riga resta `pending`, il kill switch si
+  riaccende senza toccare il DB.
+- **Un tap non autorizzato non riceve nemmeno un `answer()`.** `CallbackQueryHandler` non
+  accetta `filters`, quindi la whitelist è dentro il handler, con lo stesso silenzio dei
+  comandi: rispondere confermerebbe che il bot esiste.
+- **Guasto del DB dopo una PATCH riuscita ≠ errore.** Il tag È sul contatto: dire «errore»
+  manderebbe a cercare una scrittura che c'è. L'esecutore torna un esito che racconta cosa è
+  successo e cosa resta da sistemare a mano. Risalgono solo i guasti *prima* della scrittura.
+- **Una riga che il codice non sa leggere** (tipo sconosciuto, payload rotto) si salta in
+  consegna e, se il claim l'ha già presa, si chiude `fallita`: lasciata `approvata` resterebbe
+  lì per sempre a sembrare lavoro in corso. Un solo parser (`row_to_stored`) per i due momenti.
+
 ## Anti-pattern (NON fare)
 - NON usare webhook in v0. Pull a comando.
 - NON esporre chiavi lato client. Tutto sul backend Hetzner.
@@ -197,6 +238,10 @@ scripts/probe_rename.py, nove verifiche tutte passate).
 - NON mandare un blocco unico: schema, tabella, vocale = tre messaggi distinti.
 - NON far vedere al triage_engine strutture dati Callbell-specifiche (passa dal formato neutro).
 - NON essere zelanti sulle promesse scadute (vedi memoria).
+- NON costruire la lista di tag da scrivere partendo da `convo.tags` del triage: la PATCH è un
+  REPLACE e quella lista è vecchia. Sempre `get_contact()` prima, eco verificata dopo.
+- NON dare `allow_writes` a `build_adapter()`/`build_read_client()` «perché ora serve»: la
+  porta è `build_write_client()`, e la apre solo l'esecutore dopo un tap confermato.
 
 ## Dipendenza aperta da risolvere (T6)
 TTS per il vocale. Verificare se Leggo AI (PWA TTS esistente dell'utente) espone un endpoint
