@@ -272,6 +272,54 @@ Non aggiungere preamboli né riepiloghi di quello che stai per fare. Comincia da
   "rinomina Gabri92 → Gabri92"); se compaiono date dove i messaggi non ne portano; se lo
   `stato_sintetico` continua a saltare il nome del cliente.
 
+- **`ENABLE_PROPOSALS` è acceso in produzione dal 19/08/2026, senza il secondo A/B che la
+  nota qui sopra chiedeva.** La data è quella della prima proposta scritta (2026-08-19
+  14:34 UTC): i due run precedenti col codice di PR2 a bordo, il 16 e il 17/08, non ne
+  hanno prodotta nessuna, e questo non distingue fra flag ancora spento e finestra magra —
+  un run senza proposte non lascia traccia del flag. Registrarlo qui serve a non ritrovarsi
+  fra sei mesi a credere che la precondizione fosse stata rispettata.
+- **La raccolta però sta avvenendo lo stesso, e a costo zero.** Finché PR3 non è deployato
+  una proposta è una scrittura inerte: nasce `pending` su Supabase, non arriva a nessuno,
+  non tocca Callbell, non si vede in chat. È di fatto l'A/B esteso che mancava, con un
+  campione che cresce da sé a ogni `/triage` invece che in un pomeriggio dedicato.
+  Rilevato il 23/08/2026: **5 proposte** contro l'unica conversazione del 06/08, prodotte
+  su quattro run dal 19/08 (10, 9, 12 e 3 conversazioni); due di quei run non hanno aggiunto
+  niente, ed è l'esito atteso quando le proposte in coda bloccano già i duplicati.
+- Cosa ha esercitato davvero: `Da gestire subito` ×2 — che dipende solo da `gruppo` e non dai
+  fatti, quindi non dice niente sul blocco — **`Dimissione oggi` ×1, e questa sì: la
+  dimissione ha girato sul dato reale** — e `rename` ×2. **`Ricoverato`: zero.** Resta
+  scoperto proprio il fatto tri-valore, cioè quello con la soglia più delicata e l'unico il
+  cui tag non si toglie mai a tempo: esattamente il buco dichiarato il 06/08, dimezzato ma
+  non chiuso.
+- **La precondizione si sposta dall'accensione del flag all'APPROVAZIONE DI UN
+  `Ricoverato`, non al deploy.** PR3 si può deployare ed esercitare per intero: ❌ non scrive
+  niente su Callbell, e un ✅ su una rinomina si disfa rinominando indietro — il nome vecchio
+  è lì nel messaggio della proposta («Rinominare «Gabri92» in …»), che resta in chat sopra
+  l'esito. Anche `Da gestire subito` e `Dimissione oggi` sono limitati nel tempo: alla
+  conferma nasce la loro rimozione programmata, che matura a 48 h o il mattino dopo.
+- **`Ricoverato` è l'unico che non si disfa da sé, e non per una dimenticanza.**
+  `followups_for` non gli dà nessuna rimozione, e quell'assenza È la regola: una degenza
+  finisce quando lo dicono i messaggi, mai perché è passato del tempo — è tutto il motivo per
+  cui `fatti.ricovero` ha tre valori invece di essere un booleano. Conseguenza: un
+  `Ricoverato` messo per sbaglio non se ne va, perché aspetta un segnale di dimissione che
+  non arriverà mai (il ricovero non c'era), e la rete anti-fossile dei 14 giorni è PR4 e non
+  esiste ancora. Toglierlo costa due gesti a mano — il tag dalla UI di Callbell e la riga da
+  `system_tags`, o quella continua a dire che è nostro (runbook § G) — e nel frattempo le
+  colleghe l'hanno letto.
+- Quindi la regola operativa è una sola: **nessun ✅ su un `tag_add Ricoverato` finché non c'è
+  l'A/B su quel fatto.** Quello che l'A/B deve dimostrare è che la soglia della riga
+  "esplicitamente" tenga: senza quella parola e senza il controesempio ("l'ho portato ieri"),
+  `in_corso` scivola su qualunque conversazione che nomini una visita e le regole di PR2
+  proporrebbero il tag su mezzo archivio. Attenzione a come si legge il risultato: una
+  proposta che non arriva mai **non** è un fallimento della regola, dice che la soglia è alta
+  — quello che va escluso è il caso opposto, `Ricoverato` su una chat che parla solo di un
+  appuntamento. E con PR3 deployato l'A/B si fa **leggendo le proposte consegnate in chat**,
+  senza toccare i bottoni: la consegna stessa diventa lo strumento di misura.
+- **Alla prima consegna PR3 spedirà 5 messaggi, non 4.** La coda si consegna tutta (ogni riga
+  `pending` e matura con `telegram_message_id` nullo), e alle quattro righe del 19/08 se n'è
+  aggiunta una il 20/08. Da mettere in conto guardando la chat la prima volta, per non
+  scambiare la quinta per un duplicato.
+
 ---
 
 ## BLOCCO FATTI DI STATO (testo da usare — T10)
@@ -326,3 +374,8 @@ Se una cosa non è scritta nei messaggi, non c'è: usa "non_menzionato", null, l
   ripetibili, marcatura della specie non calata. Da rifare con più traffico prima di accendere
   `ENABLE_PROPOSALS` in produzione — questo giro non ha esercitato né un ricovero né una
   dimissione, cioè la metà dei fatti che PR2 userà davvero.
+  **Andata diversamente: il flag è stato acceso il 19/08/2026 senza quel secondo giro, e la
+  precondizione si è spostata all'approvazione di un `Ricoverato` — non al deploy di PR3, che
+  è esercitabile per intero perché ogni altra azione è reversibile o scade da sé.** Vedi le
+  ultime note dello sviluppatore: la dimissione nel frattempo è stata esercitata sul traffico
+  reale, il ricovero no.

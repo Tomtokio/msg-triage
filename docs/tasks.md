@@ -128,8 +128,11 @@ mai per nome — vedi dev_notes.
 - PR1 ✅ — fatti di stato nella stessa unica chiamata LLM, dietro `ENABLE_PROPOSALS`.
 - PR2 ✅ — migration 0002, regole deterministiche (`proposals.py`) e store (`proposal_store.py`):
   le proposte nascono `pending` su Supabase. Niente consegna, niente scritture su Callbell.
-- PR3 — consegna su Telegram coi bottoni, conferma, esecuzione su Callbell.
-- PR4 — proposte programmate (job) e rete anti-fossile + `/pulizia`.
+- PR3 ✅ — consegna su Telegram coi bottoni, conferma, esecuzione su Callbell. Si consegna
+  tutta la coda matura (anche le righe di run precedenti, anche a finestra vuota), una riga
+  una volta sola; il claim sul DB è la difesa dal doppio tap; rilettura del contatto prima
+  di ogni PATCH sui tag ed eco verificata byte per byte.
+- PR4 — il *job* che consegna le programmate senza un `/triage`, rete anti-fossile + `/pulizia`.
 
 **Completamento:** le proposte arrivano, i tap eseguono, il DB traccia il ciclo completo.
 **Dipendenze:** T9 (bot sempre attivo), T7 (tabelle proposals + system_tags).

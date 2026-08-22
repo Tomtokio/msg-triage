@@ -20,6 +20,9 @@ Write-path facts verified on real data (2026-08-01):
 
 ⚠️ This module can WRITE. :class:`CallbellClient` refuses every write unless it
 was built with ``allow_writes=True`` — see the "Write path" section of the class.
+:func:`build_adapter` (the fetch path, bot included) never grants it;
+:func:`build_write_client` is the single door, and only the T10 executor walks
+through it, only after a confirmed tap.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ BASE_URL = "https://api.callbell.eu/v1"
 DEFAULT_THROTTLE = 0.3  # seconds between successful requests (rate-limit hygiene)
 DEFAULT_PATIENCE = 30  # consecutive out-of-window contacts before we stop paging
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_TIMEOUT = 10.0  # seconds per HTTP call, same budget as SupabaseStore
 _BACKOFF_BASE = 1.0  # seconds; fallback when a 429 carries no Retry-After
 
 
@@ -165,6 +169,7 @@ class CallbellClient:
         sleep=time.sleep,
         throttle: float = DEFAULT_THROTTLE,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT,
         allow_writes: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -173,6 +178,7 @@ class CallbellClient:
         self._sleep = sleep
         self._throttle = throttle
         self._max_retries = max_retries
+        self._timeout = timeout
         self._allow_writes = allow_writes
         self.request_count = 0
 
@@ -184,15 +190,25 @@ class CallbellClient:
         params: dict | None = None,
         json: dict | None = None,
     ) -> dict:
-        """One HTTP call with throttle, 429 retry and error mapping.
+        """One HTTP call with throttle, timeout, 429 retry and error mapping.
 
         The 429 retry re-sends the SAME body. That is safe for our writes because
         ``tags`` is an absolute set and not a delta, so re-sending is idempotent.
+
+        Every call carries a ``timeout``. Without one, a Callbell socket that never
+        answers hangs the worker thread forever — invisible while the only caller was
+        ``/triage``, user-visible now that a tap on ✅ waits on this (T10/PR3): the
+        proposal would sit at "⏳ Applico…" and never resolve either way.
         """
         url = f"{self._base_url}{path}"
         for attempt in range(self._max_retries + 1):
             response = self._session.request(
-                method, url, headers=self._headers, params=params, json=json
+                method,
+                url,
+                headers=self._headers,
+                params=params,
+                json=json,
+                timeout=self._timeout,
             )
             if response.status_code == 429:
                 wait = _retry_after_seconds(response, attempt)
@@ -388,5 +404,34 @@ def build_adapter(
     The client is built WITHOUT ``allow_writes``: everything wired through here —
     the Telegram bot included — is structurally incapable of writing to Callbell.
     """
-    client = CallbellClient(config.callbell_api_key, session=session)
-    return CallbellSourceAdapter(client, patience=patience)
+    return CallbellSourceAdapter(
+        build_read_client(config, session=session), patience=patience
+    )
+
+
+def build_read_client(
+    config: Config, *, session: requests.Session | None = None
+) -> CallbellClient:
+    """A client that cannot write, for everything that only needs to read.
+
+    The fetch path goes through here (via :func:`build_adapter`), and so does T10's
+    delivery, which reads each contact's current name to phrase its question. Refusing
+    writes is structural, not a convention: the object simply has no way to do it.
+    """
+    return CallbellClient(config.callbell_api_key, session=session)
+
+
+def build_write_client(
+    config: Config, *, session: requests.Session | None = None
+) -> CallbellClient:
+    """The ONE write-capable client in the package (T10/PR3).
+
+    Deliberately separate from :func:`build_adapter`, which stays read-only: the
+    fetch path must remain structurally unable to write, so granting writes there
+    "because the bot needs them now" is exactly the mistake this split prevents.
+
+    Reachable from one place only — :mod:`msg_triage.proposal_executor`, after the
+    operator has tapped ✅ on a proposal that exists in the database. The write
+    surface itself is still the enumerated two: tags and name.
+    """
+    return CallbellClient(config.callbell_api_key, session=session, allow_writes=True)

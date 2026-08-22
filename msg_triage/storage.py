@@ -235,16 +235,27 @@ class SupabaseStore:
             raise SupabaseError(f"{table}: HTTP {response.status_code} — {_error_detail(response)}")
         return response
 
-    def insert(self, table: str, rows: list[dict]) -> None:
+    def insert(self, table: str, rows: list[dict], *, on_conflict: str | None = None) -> None:
         """POST ``rows`` into ``table``. Raises :class:`SupabaseError` on failure.
 
         ``return=minimal``: we generate every id ourselves, so there is nothing to read
         back and no row echoed into a response.
+
+        ``on_conflict`` names the unique constraint's columns and turns the insert into
+        an UPSERT. Used for ``system_tags``, whose ``unique (contact_id, tag)`` would
+        otherwise turn a re-application into a 409 — and a 409 there would report as
+        "failed" a proposal whose write on Callbell had already gone through.
         """
+        prefer = "return=minimal"
+        params = None
+        if on_conflict is not None:
+            prefer = f"{prefer},resolution=merge-duplicates"
+            params = {"on_conflict": on_conflict}
         self._send(
             table,
             self._session.post,
-            headers={**self._headers, "Prefer": "return=minimal"},
+            headers={**self._headers, "Prefer": prefer},
+            params=params,
             json=rows,
         )
 
@@ -291,6 +302,21 @@ class SupabaseStore:
         # With return=minimal PostgREST answers 204 with no body at all: asking for JSON
         # there would raise on the happy path.
         return self._rows(table, response) if "representation" in prefer else []
+
+    def delete(self, table: str, params: dict) -> None:
+        """DELETE the rows matched by ``params`` (PostgREST filter syntax).
+
+        The filter is mandatory and refused when empty, for the same reason as
+        :meth:`patch`: an unfiltered DELETE empties the whole table and there is no undo.
+        """
+        if not params:
+            raise SupabaseError(f"{table}: refusing an unfiltered DELETE")
+        self._send(
+            table,
+            self._session.delete,
+            headers={**self._headers, "Prefer": "return=minimal"},
+            params=params,
+        )
 
     def save_run(self, run: dict, states: list[dict]) -> None:
         """Insert the run, then all its states in one bulk insert.

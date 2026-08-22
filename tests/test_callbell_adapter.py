@@ -19,6 +19,8 @@ from msg_triage.callbell_adapter import (
     _parse_ts,
     _to_message,
     build_adapter,
+    build_read_client,
+    build_write_client,
 )
 from msg_triage.config import Config
 from msg_triage.source_adapter import Message, Role
@@ -68,7 +70,7 @@ class FakeSession:
         self._responses = list(responses)
         self.calls = []
 
-    def request(self, method, url, headers=None, params=None, json=None):
+    def request(self, method, url, headers=None, params=None, json=None, timeout=None):
         self.calls.append(
             {
                 "method": method,
@@ -76,6 +78,7 @@ class FakeSession:
                 "headers": headers,
                 "params": params,
                 "json": json,
+                "timeout": timeout,
             }
         )
         return self._responses.pop(0)
@@ -403,3 +406,47 @@ def test_build_adapter_wires_from_config():
         adapter._client.update_contact_tags("c1", [])
     with pytest.raises(CallbellError):
         adapter._client.update_contact_name("c1", "Mario")
+
+
+def _config() -> Config:
+    return Config(
+        callbell_api_key="k",
+        anthropic_api_key="a",
+        telegram_bot_token="t",
+        telegram_allowed_user_id=1,
+        supabase_url="u",
+        supabase_key="s",
+    )
+
+
+def test_every_call_carries_a_timeout():
+    # Without one a Callbell socket that never answers hangs the worker thread. Invisible
+    # while only /triage called it; user-visible now that a tap on ✅ waits on this.
+    session = FakeSession(
+        [FakeResponse({"contacts": [{"uuid": "a"}], "meta": {"page": 1, "pages": 1}})]
+    )
+    client = CallbellClient("key", session=session, sleep=lambda s: None, throttle=0)
+
+    list(client.iter_contacts())
+
+    assert session.calls[0]["timeout"] > 0
+
+
+def test_build_read_client_cannot_write():
+    client = build_read_client(_config())
+
+    with pytest.raises(CallbellError):
+        client.update_contact_tags("c1", [])
+    with pytest.raises(CallbellError):
+        client.update_contact_name("c1", "Mario")
+
+
+def test_build_write_client_is_the_one_door_that_opens():
+    session = FakeSession([FakeResponse({"contact": {"uuid": "c1", "tags": ["Ricoverato"]}})])
+
+    saved = build_write_client(_config(), session=session).update_contact_tags(
+        "c1", ["Ricoverato"]
+    )
+
+    assert saved["tags"] == ["Ricoverato"]
+    assert session.calls[0]["method"] == "PATCH"

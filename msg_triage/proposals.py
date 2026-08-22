@@ -25,8 +25,8 @@ Three invariants govern the whole file.
    a plausibility check first. A value we do not recognise produces NO proposal —
    never a wrong one.
 
-The proposal text shown on Telegram is PR3's job (it belongs next to the other
-renderers, which own the HTML escaping). What lives here is ``motivo``: the short
+The proposal text shown on Telegram lives in ``renderers.render_proposal``, next to the
+other renderers, which own the HTML escaping. What lives here is ``motivo``: the short
 factual Italian phrase that is stored on the row and explains why the rule fired.
 """
 
@@ -602,7 +602,7 @@ def build_proposals(
 def followups_for(proposal: Proposal, *, now: datetime) -> tuple[Proposal, ...]:
     """The calendar removals that exist only because a tag was actually applied.
 
-    Called by the executor AFTER a successful ``tag_add`` (PR3), never during a run: a
+    Called by the executor AFTER a successful ``tag_add``, never during a run: a
     scheduled removal for a tag that might never be applied would be a row somebody has
     to interpret later, and there is no honest state to give it if the add is ignored.
 

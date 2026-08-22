@@ -3,9 +3,9 @@
 ## Cos'è questo progetto
 Triage intelligente delle conversazioni WhatsApp della clinica (via Callbell).
 Legge i messaggi recenti, li giudica, produce un digest a tre livelli.
-**Non risponde mai ai clienti.** Il triage è sola lettura; l'unica scrittura che il progetto
-si concede è sui *tag* dei contatti (pulizia una tantum, poi T10). Mai un messaggio, mai
-niente che il cliente possa vedere.
+**Non risponde mai ai clienti.** Il triage è sola lettura; le uniche scritture che il
+progetto si concede sono sui *tag* e sul *nome* dei contatti, e solo dopo una conferma
+esplicita su Telegram (T10). Mai un messaggio, mai niente che il cliente possa vedere.
 
 ## Documentazione — LEGGILA PRIMA DI QUALSIASI COSA
 - `docs/project_state.md` — cos'è, obiettivi, decisioni prese
@@ -52,10 +52,30 @@ Non saltare queste pause. Mai.
   propagano. E il flag da solo non basta — senza un Supabase vero non si producono proposte.
 - Un tag non si rimuove **mai** perché è passato del tempo. Le maturazioni a calendario
   cadono alle 07:00 Europe/Rome; «oggi» è sempre quello di Roma, mai quello di UTC.
-- **Stato: PR2.** Le proposte nascono `pending` sul DB e non arrivano da nessuna parte:
-  niente Telegram, niente scritture su Callbell. Il bot resta *strutturalmente* incapace di
-  scrivere (`build_adapter()` non concede `allow_writes`). Con PR3 quello cambia: quando
-  succederà, questo punto e il fatto n.7 qui sotto vanno riscritti.
+- **Stato: PR3.** Le proposte arrivano su Telegram dopo i tre messaggi, una per messaggio,
+  coi bottoni ✅/❌; solo il tap ✅ scrive su Callbell. Il *claim* è un compare-and-swap sul
+  DB (`PATCH …&stato=eq.pending` con `return=representation`): la difesa dal doppio tap sta
+  lì, non in memoria. Si consegna **tutta la coda matura**, non solo le proposte di questo
+  run — anche a finestra vuota, perché una rimozione maturata alle 07:00 non è affare di
+  questa finestra. Una riga si consegna **una volta sola** (`telegram_message_id`), e si
+  registra dopo l'invio, mai prima.
+- **Prima di ogni PATCH sui tag si rilegge il contatto** (`get_contact`). La lista letta dal
+  triage è vecchia di ore quando arriva il tap, e la PATCH è un REPLACE: scriverla
+  cancellerebbe in silenzio i tag messi dalle colleghe nel frattempo. L'eco si confronta
+  **tag per tag, byte per byte, ordine escluso** (`tags` è un insieme anche per Callbell:
+  far fallire una scrittura riuscita per un riordino sarebbe l'errore peggiore dei due).
+  Sulla rinomina non serve rileggere (nessun collaterale da perdere), l'eco si verifica lo
+  stesso.
+- **Un guasto del DB *dopo* una PATCH riuscita non è «errore»**: il tag è sul contatto, e il
+  messaggio in chat dice esattamente quello e cosa resta da sistemare a mano. Risalgono solo
+  i guasti *prima* della scrittura, che diventano `fallita`.
+- A flag spento un tap risponde solo «Proposte disattivate» e **non edita il messaggio**: la
+  tastiera resta e la riga resta `pending`, così il kill switch si riaccende senza toccare
+  il DB.
+- **Niente eventi di telemetria per le proposte.** L'audit trail è la riga `proposals`
+  (`created_at` → `telegram_message_id` → `decided_at` → `executed_at` → `stato`); il
+  vocabolario chiuso dei metadata non ha un campo per una proposta, e un errore si vede in
+  chat subito.
 
 ## Ambiente
 - Python 3.12+ (`requires-python >= 3.12`)
@@ -122,6 +142,6 @@ Vedi `docs/dev_notes.md` per il dettaglio.
 4. I nomi dei tag sopravvivono **byte per byte, spazio finale incluso**.
 5. **`GET /contacts/:uuid` → `{"contact": {...}}`, un OGGETTO — la doc dice array di un elemento ed è sbagliata** (`json["contact"][0]` → `KeyError`).
 6. Il filtro `?tags[]=` è case-insensitive: serve a trovare i candidati, mai a stabilire cosa un contatto porti. Ricontrollo esatto lato client, senza `strip()` né `lower()`.
-7. `CallbellClient` è read-only salvo `allow_writes=True`, che `build_adapter()` non passa: il bot **non può** scrivere. Le sole due scritture esposte: `update_contact_tags()` e `update_contact_name()`.
+7. `CallbellClient` è read-only salvo `allow_writes=True`. `build_adapter()` e `build_read_client()` non lo passano: il path di lettura **non può** scrivere. L'unica porta è `build_write_client()`, e la apre solo `msg_triage/proposal_executor.py` dopo un tap ✅ su una proposta che esiste sul DB. Le sole due scritture esposte restano `update_contact_tags()` e `update_contact_name()`.
 8. **Anche `name` si scrive davvero e sopravvive byte per byte** (accenti, doppio spazio, spazio finale), senza toccare i collaterali e con la stessa forma di envelope nell'eco. Verificato 2026-08-05 con `scripts/probe_rename.py`.
 Vedi `docs/dev_notes.md` per il dettaglio.

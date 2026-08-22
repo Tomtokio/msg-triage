@@ -355,16 +355,42 @@ conteggi, durate e codici di errore — vedi `CLAUDE.md § Telemetria`.
 
 ## G. T10 — proposte organizzative (`ENABLE_PROPOSALS`)
 
-**Stato a PR2: le proposte NASCONO sul database e non arrivano da nessuna parte.** Niente
-messaggi su Telegram, niente bottoni, e soprattutto **niente scritture su Callbell** — il
-bot resta strutturalmente incapace di scriverci (`build_adapter()` non concede
-`allow_writes`). Consegna ed esecuzione sono PR3.
+**Stato a PR3: le proposte arrivano su Telegram e il tap ✅ scrive su Callbell.** Il flag
+accende tutta la catena: il blocco *fatti di stato* nella singola chiamata LLM (PR1), le
+*regole deterministiche* che ne ricavano le proposte (PR2), la consegna coi bottoni e
+l'esecuzione (PR3). Serve **anche** Supabase vero: senza database non c'è idempotenza — un
+rifiuto verrebbe dimenticato e la stessa proposta tornerebbe a ogni run — quindi il codice
+preferisce non proporre niente e lo dice una volta nel log.
 
-Il flag accende due cose insieme: il blocco *fatti di stato* nella singola chiamata LLM
-(PR1) e le *regole deterministiche* che ne ricavano le proposte (PR2). Serve **anche**
-Supabase vero: senza database non c'è idempotenza — un rifiuto verrebbe dimenticato e la
-stessa proposta tornerebbe a ogni run — quindi il codice preferisce non proporre niente e
-lo dice una volta nel log.
+Il path di lettura resta incapace di scrivere: `build_adapter()` e `build_read_client()` non
+concedono `allow_writes`. L'unica porta è `build_write_client()`, e la apre solo
+`msg_triage/proposal_executor.py` dopo un tap confermato su una proposta che esiste sul DB.
+
+> ⚠️ **Regola aperta: nessun ✅ su una proposta `Ricoverato`, per ora.** Il fatto `ricovero`
+> non è mai stato esercitato sul dato reale (l'A/B del 06/08 non lo copriva, e da quando il
+> flag è acceso non ne è ancora nata una), e `Ricoverato` è l'unico tag che non si toglie mai
+> a tempo: messo per sbaglio resta lì. Tutto il resto si può tappare — ❌ non scrive niente,
+> una rinomina si disfa rinominando indietro, `Da gestire subito` e `Dimissione oggi` hanno
+> la loro rimozione programmata. Quando la prima proposta `Ricoverato` arriva, si legge senza
+> toccare i bottoni: è quello l'A/B. Contesto in `docs/triage_system_prompt.md`, ultime "Note
+> per lo sviluppatore".
+
+### Come si comporta, in pratica
+
+- Dopo i tre messaggi del triage arriva **una proposta per messaggio**, con ✅ Applica /
+  ❌ Ignora. Arrivano **tutte quelle pending e mature**, non solo quelle nate adesso: la coda
+  parte dalle più vecchie, e vale anche quando la finestra è vuota.
+- **Ogni proposta si consegna una volta sola.** Anche se resta lì senza risposta per giorni,
+  non torna: i bottoni del messaggio funzionano finché non li tocchi.
+- **✅** → si rilegge il contatto su Callbell, si scrive, si verifica l'eco, e il messaggio
+  diventa «✅ …». **❌** → «❌ Ignorata», e Callbell non viene toccato affatto.
+- **Un secondo tap sullo stesso bottone** risponde «Proposta già gestita» e non riscrive
+  niente: la difesa sta sul database, non in memoria.
+- **A flag spento** un tap risponde solo «Proposte disattivate» e lascia il messaggio com'è:
+  riaccendi il flag e lo stesso bottone torna a funzionare.
+- Se una proposta non si può eseguire, il messaggio lo dice per esteso. In particolare
+  «*… stato non registrato in system_tags — verificare a mano*» significa che **su Callbell
+  la scrittura c'è**: manca solo la riga sul nostro database.
 
 ### I tre tag gestiti
 
@@ -376,9 +402,15 @@ gli spazi che vedi, perché li leggono le colleghe nella UI di Callbell.
 > distingue niente. Conseguenza accettata: le loro istanze la regola semantica non le
 > tocca mai; ci arriverà solo la rete dei 14 giorni (PR4).
 
+La verifica è ricontrollata **al momento del tap**, non solo al momento della proposta: se
+la riga in `system_tags` è sparita nel frattempo, la rimozione viene rifiutata senza toccare
+Callbell.
+
 ### Accendere
 
-1. La migration `0002` applicata (§ E, passo 1). Senza, il primo run fallisce.
+1. La migration `0002` applicata (§ E, passo 1). Senza, il primo run fallisce. **PR3 non
+   ha aggiunto migration**: `telegram_message_id`, `decided_at` ed `executed_at` erano già
+   in `0001`/`0002`, in attesa di chi le scrivesse.
 2. Nel `.env` sul VPS (come `msgtriage`, file `~/msg-triage/.env`, permessi 0600):
    `ENABLE_PROPOSALS=true`, con `SUPABASE_URL`/`SUPABASE_KEY` veri.
 3. `sudo systemctl restart msg-triage` — la config si legge solo allo startup.
@@ -424,8 +456,47 @@ order by created_at desc;
 > select count(*) from msg_triage.proposals where created_at > now() - interval '30 minutes';
 > ```
 
-Su Callbell, infine: **nessun tag cambiato, nessun nome cambiato.** A PR2 deve essere così
-per costruzione, non per fortuna.
+Su Callbell, finché non tocchi un bottone: **nessun tag cambiato, nessun nome cambiato.**
+Le proposte nascono e si consegnano senza scrivere niente; la scrittura è il tap.
+
+### Verifica del ciclo completo, dopo il primo tap
+
+```sql
+select tipo, stato, created_at, telegram_message_id, decided_at, executed_at
+from msg_triage.proposals order by created_at desc limit 20;
+
+select * from msg_triage.system_tags;
+```
+
+Cosa deve tornare:
+
+| Cosa hai fatto | Cosa dice il DB | Cosa dice Callbell |
+|---|---|---|
+| niente (solo consegna) | `pending`, `telegram_message_id` valorizzato | invariato |
+| ❌ | `rifiutata` + `decided_at` | invariato |
+| ✅ su un `tag_add` | `eseguita` + `executed_at`, riga in `system_tags` col `proposta_id` | tag aggiunto, **gli altri tag intatti** |
+| ✅ su una `rename` | `eseguita` + `executed_at` | nome nuovo, byte per byte |
+| ✅ su `Dimissione oggi` / `Da gestire subito` | in più una riga `tag_remove` `pending` con `matures_at` alle 07:00 di Roma | — |
+| ritap sullo stesso bottone | niente cambia | niente cambia |
+
+Il controllo che conta di più è la terza riga della colonna di destra: **gli altri tag del
+contatto devono essere ancora tutti lì**, con la stessa grafia (l'ordine può cambiare, il
+contenuto no). È il motivo per cui prima di ogni PATCH si rilegge il contatto e dopo si
+confronta quello che Callbell ha salvato con quello che gli è stato mandato.
+
+Le rimozioni programmate restano `pending` finché non maturano; poi le consegna il primo
+`/triage` successivo (il *job* che le consegna da solo è PR4).
+
+Una riga da tenere d'occhio nei log, perché risponde a una domanda ancora aperta — se
+Callbell riordini la lista dei tag quando la riscrive:
+
+```
+sudo journalctl -u msg-triage | grep -i 'riordinato i tag'
+```
+
+Non è un guasto (il contenuto è verificato tag per tag, l'ordine non lo legge nessuno), ma
+se compare vuol dire che l'ordine non si conserva, ed è un fatto da annotare in
+`dev_notes.md` come gli altri.
 
 ### Il censimento dei `Ricoverato` che restano fuori
 
@@ -448,9 +519,15 @@ Se la differenza è grossa, se ne riparla; finché non c'è il numero, la scelta
 
 ### Spegnere
 
-`ENABLE_PROPOSALS=false` + restart. Il triage torna identico a prima, byte per byte. Le
-righe `pending` restano dove sono e non fanno niente: nessuna di esse ha mai toccato
-Callbell.
+`ENABLE_PROPOSALS=false` + restart. Il triage torna identico a prima, byte per byte: niente
+proposte nuove, niente consegna, e un tap su un bottone già in chat risponde solo «Proposte
+disattivate» senza scrivere niente. Le righe `pending` restano dove sono, coi loro bottoni
+ancora validi: riaccendendo il flag riprendono a funzionare, senza mettere le mani sul DB.
+
+Quello che è già stato scritto su Callbell **non torna indietro da sé**: lo spegnimento
+ferma le azioni future, non annulla quelle passate. Per disfare un tag messo per sbaglio si
+toglie a mano dalla UI di Callbell e si cancella la riga corrispondente in
+`msg_triage.system_tags` (altrimenti quella riga continua a dire che il tag è nostro).
 
 ---
 

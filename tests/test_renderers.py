@@ -5,6 +5,7 @@ ConversationTriage/TriageResult directly and assert on the produced strings — 
 simplest style in the suite (mirrors tests/test_triage_engine.py).
 """
 
+from msg_triage.proposals import Proposal, TipoProposta
 from msg_triage.renderers import (
     _PRESIDIO_SYMBOL,
     _RUMORE_DOT,
@@ -23,6 +24,7 @@ from msg_triage.renderers import (
     _voice_rumore,
     _voice_rumore_count,
     render_all,
+    render_proposal,
     render_schema,
     render_table,
     render_voice,
@@ -789,3 +791,70 @@ def test_renderers_ignore_the_t10_facts():
 
     for render in (render_schema, render_table, render_voice):
         assert render(with_facts) == render(without)
+
+
+# --- T10: la domanda che una proposta fa su Telegram ---------------------------
+
+
+def _proposal(tipo, payload, motivo="il motivo"):
+    return Proposal(contact_id="c1", tipo=tipo, payload=payload, motivo=motivo)
+
+
+def test_una_proposta_di_tag_dice_cosa_a_chi_e_perche():
+    text = render_proposal(
+        _proposal(
+            TipoProposta.TAG_ADD,
+            {"tag": "Ricoverato"},
+            "dai messaggi risulta un ricovero in corso",
+        ),
+        nome="Mario Rossi",
+    )
+
+    assert text == (
+        "🏷️ Aggiungere il tag «<b>Ricoverato</b>» a <b>Mario Rossi</b>?\n"
+        "<i>dai messaggi risulta un ricovero in corso</i>"
+    )
+
+
+def test_una_rimozione_si_legge_come_una_rimozione():
+    text = render_proposal(
+        _proposal(TipoProposta.TAG_REMOVE, {"tag": "Dimissione oggi"}, "la dimissione era di ieri"),
+        nome="Mario Rossi",
+    )
+
+    assert text.startswith("🏷️ Togliere il tag «<b>Dimissione oggi</b>» da <b>Mario Rossi</b>?")
+
+
+def test_una_rinomina_mostra_il_nome_di_adesso_e_quello_proposto():
+    text = render_proposal(
+        _proposal(
+            TipoProposta.RENAME,
+            {"nome": "Mario Rossi coniglio Asio"},
+            "il nome attuale non è utilizzabile",
+        ),
+        nome="Gabri92",
+    )
+
+    assert text.startswith(
+        "✏️ Rinominare «<b>Gabri92</b>» in «<b>Mario Rossi coniglio Asio</b>»?"
+    )
+
+
+def test_il_testo_della_proposta_e_html_safe():
+    # Il nome arriva da Callbell e il nome proposto dal modello: nessuno dei due può
+    # aprire un tag. Prima si scappa, poi si aggiungono i nostri <b>.
+    text = render_proposal(
+        _proposal(TipoProposta.RENAME, {"nome": "A & B"}, "<b>bold</b>"),
+        nome="<script>",
+    )
+
+    assert "&lt;script&gt;" in text
+    assert "A &amp; B" in text
+    assert "<script>" not in text
+    assert "<i>&lt;b&gt;bold&lt;/b&gt;</i>" in text
+
+
+def test_una_proposta_senza_motivo_e_una_riga_sola():
+    text = render_proposal(_proposal(TipoProposta.TAG_ADD, {"tag": "Ricoverato"}, ""), nome="X")
+
+    assert "\n" not in text
